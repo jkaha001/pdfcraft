@@ -288,6 +288,8 @@ impl PdfCraftApp {
             closed_tabs: Vec::new(),
             rename_draft: None,
             rename_returned: rename_ui::Returned::default(),
+            deskew_text: Default::default(),
+            deskew_job: None,
             active: None,
             last_frame_active: None,
             mode: Mode::AllTools,
