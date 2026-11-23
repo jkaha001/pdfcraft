@@ -96,6 +96,19 @@ pub struct ClearScanReport {
     pub cancelled: bool,
 }
 
+impl ClearScanReport {
+    /// Record an apply-time failure for 0-based `page` in this report, replacing its earlier
+    /// built entry when present or appending a failed entry otherwise.
+    pub fn record_failure(&mut self, page: usize, error: impl Into<String>) {
+        let msg = error.into();
+        if let Some(slot) = self.pages.iter_mut().find(|p| p.page == page) {
+            *slot = failed_page(page, &msg);
+        } else {
+            self.pages.push(failed_page(page, &msg));
+        }
+    }
+}
+
 /// What [`Session::clearscan_job`] captured, detached from the session so a worker can run it.
 pub struct ClearScanJob {
     bytes: Arc<Vec<u8>>,
@@ -423,10 +436,7 @@ impl Session {
         let mut report = built.report;
         let partitioned = self.partition_built(id, built.built)?;
         for (page, err) in partitioned.rejected {
-            let msg = err.to_string();
-            if let Some(slot) = report.pages.iter_mut().find(|p| p.page == page) {
-                *slot = failed_page(page, &msg);
-            }
+            report.record_failure(page, err.to_string());
         }
         if !partitioned.edits.is_empty() {
             self.apply(id, Edit::Batch { label: "ClearScan".into(), edits: partitioned.edits })?;
@@ -434,14 +444,16 @@ impl Session {
         Ok(report)
     }
 
-    /// Apply pages a [`ClearScanJob`] already built, as one undoable "ClearScan" step.
-    pub fn apply_clearscan(&mut self, id: DocId, built: Vec<(usize, Vec<u8>)>) -> Result<(), ClearScanError> {
+    /// Apply pages a [`ClearScanJob`] already built, as one undoable "ClearScan" step. Returns
+    /// any `(page, error)` entries that failed validation so callers (such as the UI) can fold
+    /// them into their [`ClearScanReport`] via [`ClearScanReport::record_failure`].
+    pub fn apply_clearscan(&mut self, id: DocId, built: Vec<(usize, Vec<u8>)>) -> Result<Vec<(usize, EditError)>, ClearScanError> {
         self.apply_built(id, built)
     }
 
-    fn apply_built(&mut self, id: DocId, built: Vec<(usize, Vec<u8>)>) -> Result<(), ClearScanError> {
+    fn apply_built(&mut self, id: DocId, built: Vec<(usize, Vec<u8>)>) -> Result<Vec<(usize, EditError)>, ClearScanError> {
         if built.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut partitioned = self.partition_built(id, built)?;
         if partitioned.edits.is_empty()
@@ -452,7 +464,7 @@ impl Session {
         if !partitioned.edits.is_empty() {
             self.apply(id, Edit::Batch { label: "ClearScan".into(), edits: partitioned.edits })?;
         }
-        Ok(())
+        Ok(partitioned.rejected)
     }
 
     fn partition_built(&self, id: DocId, built: Vec<(usize, Vec<u8>)>) -> Result<PartitionedBuilt, ClearScanError> {
@@ -1299,10 +1311,26 @@ mod tests {
             .expect("set repl contents");
         let valid_page_pdf = pdfcraft_cos::write_full(&repl_cos, &pdfcraft_cos::SaveOptions::default()).expect("write repl").to_vec();
 
-        // Mixing a valid built page with a corrupt built page still applies the valid page in one undo step.
-        session
+        // Mixing a valid built page with a corrupt built page still applies the valid page in one undo step
+        // and returns the rejected page so callers can update their report.
+        let rejected = session
             .apply_clearscan(id, vec![(0, valid_page_pdf.clone()), (1, b"not a pdf".to_vec())])
             .expect("valid page should survive corrupt sibling");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0, 1);
+        let mut report = ClearScanReport {
+            pages: vec![
+                ClearScanPage { page: 0, text: "Survived".into(), glyphs: 8, clusters: 7, erased: 100, bytes: 500, skipped: None, error: None },
+                ClearScanPage { page: 1, text: "Bad".into(), glyphs: 3, clusters: 3, erased: 30, bytes: 9, skipped: None, error: None },
+            ],
+            cancelled: false,
+        };
+        for (page, err) in rejected {
+            report.record_failure(page, err.to_string());
+        }
+        assert!(report.pages[0].error.is_none());
+        assert!(report.pages[1].error.is_some());
+        assert_eq!(report.pages[1].glyphs, 0);
         assert_eq!(session.get(id).expect("doc").can_undo(), Some("ClearScan"));
         assert!(!session.get(id).expect("doc").text_lines(0).is_empty());
         assert!(session.get(id).expect("doc").text_lines(1).is_empty());
@@ -1330,5 +1358,45 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(job_err, ClearScanError::Edit(EditError::NotPermitted(_))), "unexpected error: {job_err:?}");
+    }
+
+    #[test]
+    fn clearscan_allows_white_backdrop_under_scan_but_skips_overlays_and_coloured_fills() {
+        use pdfcraft_cos::{Dict, Document, Object, SaveOptions, Stream, write_full};
+
+        let png = crate::export::encode_png(32, 32, &vec![250_u8; 32 * 32 * 4]).expect("png");
+        let mut session = Session::new();
+        let scan_bytes = session.create_from_images(&[("scan.png".into(), png)]).expect("scan");
+
+        let wrap = |prefix: &[u8], suffix: &[u8]| -> Arc<Vec<u8>> {
+            let mut cos = Document::open(Arc::clone(&scan_bytes)).expect("open scan");
+            let page = pdfcraft_model::pages(&cos).swap_remove(0);
+            let orig = page.dict.get(b"Contents").cloned().expect("contents");
+            let mut parts = Vec::new();
+            if !prefix.is_empty() {
+                parts.push(Object::Ref(cos.add(Object::Stream(Stream::flate(Dict::new(), prefix)))));
+            }
+            parts.push(orig);
+            if !suffix.is_empty() {
+                parts.push(Object::Ref(cos.add(Object::Stream(Stream::flate(Dict::new(), suffix)))));
+            }
+            cos.update_dict(page.obj, |p| p.set(b"Contents".to_vec(), Object::Array(parts))).expect("update contents");
+            Arc::new(write_full(&cos, &SaveOptions::default()).expect("write"))
+        };
+
+        // White background rectangles painted before the scan image are NOT flagged as vector art.
+        for backdrop in [b"1 1 1 rg 0 0 32 32 re f\n".as_slice(), b"1 g 0 0 32 32 re f\n", b"0 0 0 0 k 0 0 32 32 re f\n"] {
+            let pdf = wrap(backdrop, b"");
+            let cos = Document::open(Arc::clone(&pdf)).expect("reopen");
+            assert!(!pdfcraft_edit::page_scan_content(&cos, 0).expect("scan content").has_vector_or_inline);
+            let id = session.open("backdrop.pdf", None, pdf, None).expect("open");
+            let job = session.clearscan_job(id, &[], ClearScanSettings::default()).expect("job");
+            assert!(job.skip_reasons[0].is_none(), "white backdrop must not skip scan: {:?}", job.skip_reasons[0]);
+        }
+
+        // White fill AFTER the image (e.g., white-out overlay) and coloured fill BEFORE the image MUST still skip.
+        assert_clearscan_skipped(wrap(b"", b"\n1 1 1 rg 4 4 10 10 re f\n"), "vector");
+        assert_clearscan_skipped(wrap(b"1 0 0 rg 0 0 32 32 re f\n", b""), "vector");
+        assert_clearscan_skipped(wrap(b"1 1 1 rg 0 0 32 32 re B\n", b""), "vector");
     }
 }

@@ -21,8 +21,6 @@
 
 use ocrs::{TextChar, TextItem};
 
-use crate::OcrError;
-
 /// One recognized character and its box, in image pixels `[left, top, right, bottom]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CharBox {
@@ -68,7 +66,7 @@ fn union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
 }
 
-fn is_descender_char(c: char) -> bool {
+pub(crate) fn is_descender_char(c: char) -> bool {
     "gjpqyQ".contains(c)
 }
 
@@ -145,14 +143,22 @@ impl AnnotatedLine {
 
 /// The words of one recognized ocrs line: characters grouped between spaces, each word's box
 /// the union of its characters' boxes. Space characters are separators, not items.
+#[cfg(test)]
 fn words_from_chars(chars: &[TextChar]) -> Vec<AnnotatedWord> {
+    words_from_chars_clipped(chars, None)
+}
+
+fn words_from_chars_clipped(chars: &[TextChar], before: Option<rten_imageproc::RectF>) -> Vec<AnnotatedWord> {
     chars
         .split(|c| c.char == ' ')
         .filter(|group| !group.is_empty())
         .map(|group| {
             let chars = group
                 .iter()
-                .map(|c| CharBox { char: c.char, rect: [c.rect.left() as f32, c.rect.top() as f32, c.rect.right() as f32, c.rect.bottom() as f32] })
+                .map(|c| CharBox {
+                    char: c.char,
+                    rect: crate::ocrs::clip([c.rect.left() as f32, c.rect.top() as f32, c.rect.right() as f32, c.rect.bottom() as f32], before),
+                })
                 .collect::<Vec<_>>();
             let rect = chars.iter().map(|c| c.rect).reduce(union).unwrap_or([0.0; 4]);
             let text = chars.iter().map(|c| c.char).collect();
@@ -162,27 +168,12 @@ fn words_from_chars(chars: &[TextChar]) -> Vec<AnnotatedWord> {
         .collect()
 }
 
-/// Run the recognition engine over a grey or RGB image and read out the annotated hierarchy.
-///
-/// This is the same pipeline [`crate::Ocr::recognize`] runs (detection, line finding,
-/// recognition); it keeps the characters instead of folding them away.
-pub fn recognize(engine: &ocrs::OcrEngine, pixels: &[u8], width: u32, height: u32) -> Result<Vec<AnnotatedLine>, OcrError> {
-    if width == 0 || height == 0 || pixels.is_empty() {
-        return Err(OcrError::EmptyImage);
-    }
-    // ocrs wants 1 or 3 channels.
-    let rgb: std::borrow::Cow<[u8]> = if pixels.len() == (width as u64 * height as u64 * 4) as usize {
-        pixels.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect::<Vec<u8>>().into()
-    } else {
-        pixels.into()
-    };
-    let err = |e: &dyn std::fmt::Display| OcrError::Recognize(e.to_string());
-    let source = ocrs::ImageSource::from_bytes(&rgb, (width, height)).map_err(|e| err(&e))?;
-    let input = engine.prepare_input(source).map_err(|e| err(&e))?;
-    let found = engine.detect_words(&input).map_err(|e| err(&e))?;
-    let lines = engine.find_text_lines(&input, &found);
-    let read = engine.recognize_text(&input, &lines).map_err(|e| err(&e))?;
-    Ok(read.into_iter().flatten().map(|line| AnnotatedLine::measure(words_from_chars(line.chars()))).filter(|l| !l.words.is_empty()).collect())
+pub(crate) fn from_text_lines(lines: Vec<(ocrs::TextLine, Option<rten_imageproc::RectF>)>) -> Vec<AnnotatedLine> {
+    lines
+        .into_iter()
+        .map(|(line, before)| AnnotatedLine::measure(words_from_chars_clipped(line.chars(), before)))
+        .filter(|l| !l.words.is_empty())
+        .collect()
 }
 
 #[cfg(test)]

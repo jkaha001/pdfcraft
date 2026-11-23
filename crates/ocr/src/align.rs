@@ -189,28 +189,110 @@ fn push_box(boxes: &mut Vec<InkBox>, rect: [f32; 4], text: String, source: CharR
     boxes.push(InkBox { rect, text, source });
 }
 
+struct BoxGrid {
+    cell: f32,
+    cells: std::collections::HashMap<(i32, i32), Vec<usize>>,
+    large: Vec<usize>,
+}
+
+impl BoxGrid {
+    const CELL: f32 = 64.0;
+    const MAX_CELLS_PER_ITEM: usize = 64;
+
+    fn build(boxes: &[InkBox]) -> Self {
+        let mut cells: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
+        let mut large = Vec::new();
+        for (idx, ink) in boxes.iter().enumerate() {
+            match Self::cell_range(ink.rect, Self::CELL) {
+                Some((cx0, cy0, cx1, cy1)) => {
+                    for cy in cy0..=cy1 {
+                        for cx in cx0..=cx1 {
+                            cells.entry((cx, cy)).or_default().push(idx);
+                        }
+                    }
+                }
+                None => large.push(idx),
+            }
+        }
+        Self { cell: Self::CELL, cells, large }
+    }
+
+    fn cell_range(rect: [f32; 4], cell: f32) -> Option<(i32, i32, i32, i32)> {
+        if rect.iter().any(|v| !v.is_finite()) || rect[2] <= rect[0] || rect[3] <= rect[1] {
+            return None;
+        }
+        let cx0 = (rect[0] / cell).floor();
+        let cy0 = (rect[1] / cell).floor();
+        let cx1 = (rect[2] / cell).floor();
+        let cy1 = (rect[3] / cell).floor();
+        if cx0 < i32::MIN as f32 || cx1 > i32::MAX as f32 || cy0 < i32::MIN as f32 || cy1 > i32::MAX as f32 {
+            return None;
+        }
+        let (cx0, cy0, cx1, cy1) = (cx0 as i32, cy0 as i32, cx1 as i32, cy1 as i32);
+        let nx = i64::from(cx1).saturating_sub(i64::from(cx0)).saturating_add(1);
+        let ny = i64::from(cy1).saturating_sub(i64::from(cy0)).saturating_add(1);
+        if nx <= 0 || ny <= 0 || nx.saturating_mul(ny) > Self::MAX_CELLS_PER_ITEM as i64 {
+            return None;
+        }
+        Some((cx0, cy0, cx1, cy1))
+    }
+
+    fn query(&self, rect: [f32; 4], total_boxes: usize, seen: &mut [u32], stamp: &mut u32, out: &mut Vec<usize>) {
+        out.clear();
+        let Some((cx0, cy0, cx1, cy1)) = Self::cell_range(rect, self.cell) else {
+            out.extend(0..total_boxes);
+            return;
+        };
+        *stamp = stamp.wrapping_add(1);
+        if *stamp == 0 {
+            seen.fill(0);
+            *stamp = 1;
+        }
+        let mark = *stamp;
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                if let Some(bucket) = self.cells.get(&(cx, cy)) {
+                    for &idx in bucket {
+                        if let Some(slot) = seen.get_mut(idx)
+                            && *slot != mark
+                        {
+                            *slot = mark;
+                            out.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+        for &idx in &self.large {
+            if let Some(slot) = seen.get_mut(idx)
+                && *slot != mark
+            {
+                *slot = mark;
+                out.push(idx);
+            }
+        }
+    }
+}
+
 fn link_glyphs(components: &ComponentSet, boxes: &[InkBox], params: &AlignParams) -> Links {
     let comp_slice = components.components();
     let mut by_component = vec![Vec::new(); comp_slice.len()];
-    let mut boxes_by_y: Vec<usize> = (0..boxes.len()).collect();
-    boxes_by_y.sort_by(|&a, &b| boxes[a].rect[1].total_cmp(&boxes[b].rect[1]).then_with(|| a.cmp(&b)));
-    let max_box_h = boxes.iter().map(|b| (b.rect[3] - b.rect[1]).max(0.0)).fold(0.0_f32, f32::max);
+    let grid = BoxGrid::build(boxes);
+    let mut seen = vec![0_u32; boxes.len()];
+    let mut stamp = 0_u32;
+    let mut candidates = Vec::new();
     for (index, component) in comp_slice.iter().enumerate() {
         if component.kind != ComponentKind::Glyph {
             continue;
         }
         let blob = component.rect();
-        let min_top = blob[1] - max_box_h;
-        let start = boxes_by_y.partition_point(|&i| boxes[i].rect[1] < min_top);
+        grid.query(blob, boxes.len(), &mut seen, &mut stamp, &mut candidates);
         let Some(of_component) = by_component.get_mut(index) else {
             continue;
         };
-        for &box_index in &boxes_by_y[start..] {
+        for &box_index in &candidates {
             let Some(ink) = boxes.get(box_index) else { continue };
-            if ink.rect[1] >= blob[3] {
-                break;
-            }
-            if ink.rect[3] <= blob[1] || ink.rect[2] <= blob[0] || ink.rect[0] >= blob[2] {
+            if ink.rect[3] <= blob[1] || ink.rect[1] >= blob[3] || ink.rect[2] <= blob[0] || ink.rect[0] >= blob[2] {
                 continue;
             }
             let Some(score) = match_score(component, ink.rect, params) else {
@@ -871,6 +953,40 @@ mod tests {
         let texts: Vec<_> = aligned.matched.iter().map(|g| role_text(&g.role)).collect();
         assert_eq!(texts, ["f", "t"], "overhanging f hook must not turn 'ft' into 'ftt': {:?}", roles(&aligned));
         assert!(aligned.matched.iter().all(|g| matches!(g.role, MatchRole::Character { .. })));
+    }
+
+    #[test]
+    fn spatial_grid_handles_wide_single_line_cell_straddle_and_large_box() {
+        // 20 glyphs laid out horizontally across >1200 px on one line (including glyphs straddling
+        // the 64 px cell boundary at x=64, x=128, ...), plus a 600x600 spanning box below the line
+        // (>64 cells: 10x11 = 110 cells) that goes into BoxGrid::large and claims its own glyph.
+        let count = 20_u32;
+        let width = count * 60 + 60;
+        let height = 670_u32;
+        let image = bitmap(width, height, |x, y| {
+            let col = x / 60;
+            let local_x = x % 60;
+            let on_line = col < count && (2..12).contains(&local_x) && (20..40).contains(&y);
+            let in_large = (620..630).contains(&x) && (80..100).contains(&y);
+            on_line || in_large
+        });
+        let set = analyze(&image, &AnalyzeOptions::default()).unwrap();
+        let chars: Vec<CharBox> = (0..count)
+            .map(|i| {
+                let x0 = (i * 60 + 2) as f32;
+                ch('a', [x0, 20.0, x0 + 10.0, 40.0])
+            })
+            .collect();
+        // Spanning word box covering 10x11 = 110 grid cells (> MAX_CELLS_PER_ITEM = 64).
+        let large_word = word("I", [600.0, 60.0, 1200.0, 660.0], vec![]);
+        let lines = vec![line(vec![word(&"a".repeat(count as usize), [2.0, 20.0, (count * 60) as f32, 40.0], chars), large_word])];
+        let boxes = collect_boxes(&lines);
+        let grid = BoxGrid::build(&boxes);
+        assert_eq!(grid.large.len(), 1, "600x600 box must land in BoxGrid::large");
+        let aligned = align(&set, &lines, &AlignParams::default());
+        assert_eq!(aligned.matched.len(), count as usize + 1);
+        assert_eq!(aligned.matched.iter().filter(|g| role_text(&g.role) == "a").count(), count as usize);
+        assert_eq!(aligned.matched.iter().filter(|g| role_text(&g.role) == "I").count(), 1);
     }
 
     fn roles(aligned: &PageAlignment) -> Vec<&MatchRole> {

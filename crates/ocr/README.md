@@ -89,11 +89,13 @@ let layer = visible_text_layer(&placed, &plan);          // visible text: the ed
   16×16 similarity-hash gate at `signature_tolerance = 96` of 256 bits in `cluster`), traces
   and fits cubic Bézier masters (`vectorize`: Suzuki–Abe contours plus Douglas–Peucker +
   least-squares cubic fits in a 1000-unit em square), packs up to 255 charprocs (`PER_FONT = 255`,
-  codes `1..=255`) per `/Type3` font with an `/Adobe-Identity-UCS` `/ToUnicode` CMap (`type3`),
+  codes `1..=255`, reserving one code in `F1` for an invisible `U+0020` space glyph) per `/Type3`
+  font with an `/Adobe-Identity-UCS` `/ToUnicode` CMap (`type3`),
   erases matched glyph ink from the rectified background using ring-sampled median fill while
   protecting unlinked graphics/halos (`background`), and emits replacement page content in
   original page geometry (`clearscan_image_with_geometry` / `clearscan_recognized_with_geometry`)
-  with per-glyph sampled ink colours and XY-cut reading order.
+  with per-glyph sampled ink colours (RGB and 1-channel grey), explicit word spaces, and XY-cut
+  reading order.
 
 ## Where it is wired
 

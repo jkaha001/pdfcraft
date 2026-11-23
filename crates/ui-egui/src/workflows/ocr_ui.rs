@@ -1030,9 +1030,12 @@ impl PdfCraftApp {
             self.notify_tr("The document changed while ClearScan ran, so its result was not applied");
             return;
         }
-        let report = built.report;
+        let mut report = built.report;
         match self.session.apply_clearscan(doc, built.built) {
-            Ok(()) => {
+            Ok(rejected) => {
+                for (page, err) in rejected {
+                    report.record_failure(page, err.to_string());
+                }
                 if let Some(info) = self.session.get(doc).map(|d| d.info.clone())
                     && let Some(view) = self.views.iter_mut().find(|v| v.id == doc)
                 {

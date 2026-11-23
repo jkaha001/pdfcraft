@@ -199,6 +199,125 @@ pub fn derender_with_page_mask(
     derender_limited(raster, text, protect, page_mask, params, LOCAL_MAP_PIXELS)
 }
 
+struct ProtectIndex {
+    cells: std::collections::HashMap<(u32, u32), Vec<usize>>,
+    large: Vec<usize>,
+}
+
+impl ProtectIndex {
+    const CELL: u32 = 64;
+    const MAX_CELLS_PER_ITEM: u64 = 64;
+
+    fn build(protect: &[InkRegion<'_>]) -> Self {
+        let mut cells: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+        let mut large = Vec::new();
+        for (idx, kept) in protect.iter().enumerate() {
+            let Some(rect) = Rect::from_bounds(kept.bounds) else { continue };
+            match Self::cell_range(rect) {
+                Some((cx0, cy0, cx1, cy1)) => {
+                    for cy in cy0..=cy1 {
+                        for cx in cx0..=cx1 {
+                            cells.entry((cx, cy)).or_default().push(idx);
+                        }
+                    }
+                }
+                None => large.push(idx),
+            }
+        }
+        Self { cells, large }
+    }
+
+    fn cell_range(rect: Rect) -> Option<(u32, u32, u32, u32)> {
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return None;
+        }
+        let cx0 = rect.left / Self::CELL;
+        let cy0 = rect.top / Self::CELL;
+        let cx1 = rect.right.saturating_sub(1) / Self::CELL;
+        let cy1 = rect.bottom.saturating_sub(1) / Self::CELL;
+        let nx = u64::from(cx1.saturating_sub(cx0)).saturating_add(1);
+        let ny = u64::from(cy1.saturating_sub(cy0)).saturating_add(1);
+        if nx.saturating_mul(ny) > Self::MAX_CELLS_PER_ITEM {
+            return None;
+        }
+        Some((cx0, cy0, cx1, cy1))
+    }
+
+    fn overlapping<'a>(&self, outer: Rect, protect: &[InkRegion<'a>], seen: &mut [u32], stamp: &mut u32, out: &mut Vec<InkRegion<'a>>) {
+        out.clear();
+        let Some((cx0, cy0, cx1, cy1)) = Self::cell_range(outer) else {
+            for &kept in protect {
+                if Rect::from_bounds(kept.bounds).is_some_and(|r| r.overlaps(outer)) {
+                    out.push(kept);
+                }
+            }
+            return;
+        };
+        *stamp = stamp.wrapping_add(1);
+        if *stamp == 0 {
+            seen.fill(0);
+            *stamp = 1;
+        }
+        let mark = *stamp;
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                if let Some(bucket) = self.cells.get(&(cx, cy)) {
+                    for &idx in bucket {
+                        if let Some(slot) = seen.get_mut(idx)
+                            && *slot != mark
+                        {
+                            *slot = mark;
+                            if let Some(&kept) = protect.get(idx)
+                                && Rect::from_bounds(kept.bounds).is_some_and(|r| r.overlaps(outer))
+                            {
+                                out.push(kept);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for &idx in &self.large {
+            if let Some(slot) = seen.get_mut(idx)
+                && *slot != mark
+            {
+                *slot = mark;
+                if let Some(&kept) = protect.get(idx)
+                    && Rect::from_bounds(kept.bounds).is_some_and(|r| r.overlaps(outer))
+                {
+                    out.push(kept);
+                }
+            }
+        }
+    }
+}
+
+struct ProtectLookup<'a, 'b> {
+    protect: &'b [InkRegion<'a>],
+    index: ProtectIndex,
+    seen: Vec<u32>,
+    stamp: u32,
+    local: Vec<InkRegion<'a>>,
+}
+
+impl<'a, 'b> ProtectLookup<'a, 'b> {
+    fn new(protect: &'b [InkRegion<'a>]) -> Self {
+        Self { protect, index: ProtectIndex::build(protect), seen: vec![0_u32; protect.len()], stamp: 0, local: Vec::new() }
+    }
+
+    fn overlapping(&mut self, outer: Rect) -> &[InkRegion<'a>] {
+        self.index.overlapping(outer, self.protect, &mut self.seen, &mut self.stamp, &mut self.local);
+        &self.local
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EraseConfig {
+    halo: u32,
+    radius: u32,
+    local_limit: u64,
+}
+
 fn derender_limited(
     raster: &PageRaster,
     text: &[InkRegion<'_>],
@@ -209,11 +328,11 @@ fn derender_limited(
 ) -> Result<CleanedPage, OcrError> {
     let mut cleaned = raster.clone();
     let page_mask = page_mask.filter(|mask| mask.width() == raster.width() && mask.height() == raster.height());
-    let halo = params.halo.min(MAX_HALO);
-    let radius = params.sample_radius.min(MAX_SAMPLE_RADIUS);
+    let config = EraseConfig { halo: params.halo.min(MAX_HALO), radius: params.sample_radius.min(MAX_SAMPLE_RADIUS), local_limit };
+    let mut lookup = ProtectLookup::new(protect);
     let mut erased = 0_u64;
     for region in text {
-        erased = erased.saturating_add(erase_region(&mut cleaned, region, protect, page_mask, halo, radius, local_limit));
+        erased = erased.saturating_add(erase_region(&mut cleaned, region, &mut lookup, page_mask, config));
     }
     Ok(CleanedPage { raster: cleaned, erased })
 }
@@ -221,26 +340,23 @@ fn derender_limited(
 fn erase_region(
     raster: &mut PageRaster,
     region: &InkRegion<'_>,
-    protect: &[InkRegion<'_>],
+    lookup: &mut ProtectLookup<'_, '_>,
     page_mask: Option<&Bitmap>,
-    halo: u32,
-    radius: u32,
-    local_limit: u64,
+    config: EraseConfig,
 ) -> u64 {
     let Some(bounds) = Rect::from_bounds(region.bounds) else {
         return 0;
     };
-    let paint = bounds.expand(halo, raster.width, raster.height);
+    let paint = bounds.expand(config.halo, raster.width, raster.height);
     let Some(paint) = paint else {
         return 0;
     };
-    let outer = bounds.expand(halo.saturating_add(radius), raster.width, raster.height).unwrap_or(paint);
-    let local_protect: Vec<InkRegion<'_>> =
-        protect.iter().copied().filter(|kept| Rect::from_bounds(kept.bounds).is_some_and(|r| r.overlaps(outer))).collect();
-    let side = tile_side(local_limit, halo);
+    let outer = bounds.expand(config.halo.saturating_add(config.radius), raster.width, raster.height).unwrap_or(paint);
+    let local_protect = lookup.overlapping(outer);
+    let side = tile_side(config.local_limit, config.halo);
     // One paper colour for the whole glyph. A tile in the middle of a letter has no paper of
     // its own, and sampling there would fall back to white and leave a pale block.
-    let paper = sample_around(raster, bounds, &local_protect, page_mask, halo, radius);
+    let paper = sample_around(raster, bounds, local_protect, page_mask, config.halo, config.radius);
     let mut erased = 0_u64;
     let mut top = paint.top;
     while top < paint.bottom {
@@ -249,7 +365,7 @@ fn erase_region(
         while left < paint.right {
             let right = left.saturating_add(side).min(paint.right);
             let tile = Rect { left, top, right, bottom };
-            erased = erased.saturating_add(erase_tile(raster, region, &local_protect, page_mask, tile, halo, &paper));
+            erased = erased.saturating_add(erase_tile(raster, region, local_protect, page_mask, tile, config.halo, &paper));
             left = right;
         }
         top = bottom;
@@ -1281,5 +1397,37 @@ mod tests {
         let mut page = raster(256, 256, 3, &[245, 245, 245]);
         paint_rect(&mut page, [1, 0, 2, 1], &[20, 40, 210]);
         assert_eq!(encoding_for(&page), BackgroundEncoding::FlateRgb, "thin coloured mark must not be dropped as FlateGray");
+    }
+
+    #[test]
+    fn protect_index_preserves_cell_straddling_and_large_protected_regions() {
+        let mut page = raster(600, 600, 1, &[245]);
+        // Text [58..64, 20..30] sits entirely in grid cell (0, 0), while the adjacent protected
+        // mark [65..70, 20..30] starts across the x = 64 cell boundary in cell (1, 0) within
+        // halo = 2. Also include a distant protected mark at [520..530, 520..530] and a large
+        // spanning frame [0..600, 0..600] (10x10 = 100 > 64 cells, exercising ProtectIndex::large).
+        paint_rect(&mut page, [58, 20, 64, 30], &[10]);
+        paint_rect(&mut page, [65, 20, 70, 30], &[15]);
+        paint_rect(&mut page, [520, 520, 530, 530], &[15]);
+        paint_rect(&mut page, [0, 0, 600, 2], &[15]);
+
+        let text_mask = solid_mask(6, 10);
+        let straddle_mask = solid_mask(5, 10);
+        let far_mask = solid_mask(10, 10);
+        let page_binary = mask(600, 600, |x, y| {
+            ((58..64).contains(&x) && (20..30).contains(&y))
+                || ((65..70).contains(&x) && (20..30).contains(&y))
+                || ((520..530).contains(&x) && (520..530).contains(&y))
+                || y < 2
+        });
+        let text = [region([58, 20, 64, 30], Some(&text_mask))];
+        let protect = [region([65, 20, 70, 30], Some(&straddle_mask)), region([520, 520, 530, 530], Some(&far_mask)), region([0, 0, 600, 600], None)];
+        assert_eq!(ProtectIndex::build(&protect).large.len(), 1, "600x600 frame must land in ProtectIndex::large");
+        let cleaned =
+            derender_with_page_mask(&page, &text, &protect, Some(&page_binary), &DerenderParams { halo: 2, sample_radius: 4 }).expect("clean");
+        assert_rect(cleaned.raster(), [58, 20, 64, 30], &[245]);
+        assert_rect(cleaned.raster(), [65, 20, 70, 30], &[15]);
+        assert_rect(cleaned.raster(), [520, 520, 530, 530], &[15]);
+        assert_eq!(cleaned.raster().pixel(100, 0), Some(&[15][..]));
     }
 }

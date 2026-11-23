@@ -17,7 +17,7 @@ use pdfcraft_cos::{Dict, Document, Object, SaveOptions, Stream, write_full};
 use crate::Ocr;
 use crate::OcrError;
 use crate::align::{AlignParams, MatchRole, ResolvedGlyph, align};
-use crate::annotations::AnnotatedLine;
+use crate::annotations::{AnnotatedLine, is_descender_char};
 use crate::background::{
     ClearScanLayer, DerenderParams, InkRegion, PageRaster, content_stream, derender_with_page_mask, embed_background, encoding_for, protected_regions,
 };
@@ -30,6 +30,8 @@ use crate::vectorize::{GlyphOutline, VectorizeParams, vectorize};
 
 /// Drawing glyphs in one simple Type 3 font. Matches the limit in [`crate::synthesize_type3`].
 const PER_FONT: usize = 255;
+/// Masters placed in `F1`, leaving one charproc code for the explicit U+0020 space glyph.
+const FIRST_FONT_MASTERS: usize = PER_FONT - 1;
 /// How many Type 3 fonts one page will hold. Past this, further clusters are counted and left out.
 pub const MAX_FONTS: usize = 16;
 /// Downsample factors the pipeline accepts. `1` keeps the raster.
@@ -226,17 +228,18 @@ where
         return Err(clearscan_err("deskewing made the page scale unusable"));
     }
     progress(ClearScanStage::Recognize);
-    let lines = recognize(&page)?;
+    let mut lines = recognize(&page)?;
     progress(ClearScanStage::Components);
     let components = analyze_page(&page, &options.analyze)?;
     progress(ClearScanStage::Align);
     let mut aligned = align(&components, &lines, &options.align);
     // A split letter (the stem and the dot) would otherwise embed the character once per piece.
     assign_fragment_text(&mut aligned.matched);
+    let refined_lines = refine_line_baselines(&mut lines, &aligned.matched);
     progress(ClearScanStage::Cluster);
     let clustered = cluster(&page.grey, &aligned.matched, &options.cluster);
     progress(ClearScanStage::Vectorize);
-    let (masters, skipped_clusters) = masters_of(&clustered, &aligned.matched, &lines, options)?;
+    let (masters, skipped_clusters) = masters_of(&clustered, &aligned.matched, &lines, &refined_lines, options)?;
     progress(ClearScanStage::Compose);
     let raster = deskewed_raster(&buf, src_w, src_h, raster.channels, &page)?;
     let frame = ComposeFrame { points_per_pixel: deskew_ppp, source_ppp, to_original: page.to_original, geometry, page_mask: &page.binary };
@@ -366,14 +369,74 @@ struct Master {
 }
 
 struct Occurrence {
-    line: usize,
-    word: usize,
+    line: Option<usize>,
+    word: Option<usize>,
     y_down: f64,
     origin_x: f64,
     text: String,
     /// The piece the background loses when this occurrence is drawn.
     bounds: [u32; 4],
     mask: Option<crate::binarize::Bitmap>,
+}
+
+/// Refine each line's baseline from the actual binarized ink bottoms of non-descender
+/// alphanumeric components on that line. Real `ocrs` slices the whole line box vertically, so
+/// every `CharBox` on a line where every word has a descender shares the descender bottom; the
+/// linked connected components still expose the true pixel baseline. Returns a per-line flag
+/// indicating whether non-descender components anchored the baseline.
+fn refine_line_baselines(lines: &mut [AnnotatedLine], glyphs: &[ResolvedGlyph]) -> Vec<bool> {
+    let mut non_descenders: Vec<Vec<f64>> = vec![Vec::new(); lines.len()];
+    let mut descenders: Vec<Vec<f64>> = vec![Vec::new(); lines.len()];
+    for glyph in glyphs {
+        let (line_idx, text) = match &glyph.role {
+            MatchRole::Character { text, source } | MatchRole::Fragment { text, source } => (source.line, text.as_str()),
+            MatchRole::Ligature { text, sources } => {
+                let Some(source) = sources.first() else { continue };
+                (source.line, text.as_str())
+            }
+            MatchRole::Unmatched => continue,
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let bottom = f64::from(glyph.component.bounds[3]);
+        if !bottom.is_finite() {
+            continue;
+        }
+        if text.chars().all(|c| c.is_alphanumeric() && !is_descender_char(c)) {
+            if let Some(bucket) = non_descenders.get_mut(line_idx) {
+                bucket.push(bottom);
+            }
+        } else if text.chars().any(is_descender_char)
+            && let Some(bucket) = descenders.get_mut(line_idx)
+        {
+            bucket.push(bottom);
+        }
+    }
+    let mut refined = vec![false; lines.len()];
+    for (line_idx, line) in lines.iter_mut().enumerate() {
+        let Some(mut bottoms) = non_descenders.get_mut(line_idx).map(std::mem::take) else { continue };
+        let Some(true_baseline) = median(&mut bottoms) else { continue };
+        let old_baseline = line.baseline;
+        line.baseline = true_baseline as f32;
+        let shift = old_baseline - line.baseline;
+        if shift.is_finite() && shift > 0.0 {
+            if line.cap_height > shift {
+                line.cap_height -= shift;
+            }
+            if line.x_height > shift {
+                line.x_height -= shift;
+            }
+        }
+        let word_descent =
+            line.words.iter().filter(|w| w.text.chars().any(is_descender_char)).map(|w| (w.rect[3] - line.baseline).max(0.0)).fold(0.0_f32, f32::max);
+        let comp_descent = descenders.get(line_idx).into_iter().flatten().map(|&b| ((b - true_baseline).max(0.0)) as f32).fold(0.0_f32, f32::max);
+        line.descent = word_descent.max(comp_descent);
+        if let Some(slot) = refined.get_mut(line_idx) {
+            *slot = true;
+        }
+    }
+    refined
 }
 
 /// One character that labeling split into several blobs keeps its text on the largest piece.
@@ -411,6 +474,7 @@ fn masters_of(
     clustered: &crate::cluster::Clusters,
     glyphs: &[ResolvedGlyph],
     lines: &[AnnotatedLine],
+    refined_lines: &[bool],
     options: &ClearScanOptions,
 ) -> Result<(Vec<Master>, usize), OcrError> {
     let mut masters = Vec::new();
@@ -430,15 +494,20 @@ fn masters_of(
             skipped = skipped.saturating_add(1);
             continue;
         }
-        let mut prototype_baselines = Vec::new();
+        let mut refined_baselines = Vec::new();
+        let mut all_baselines = Vec::new();
         for &index in group.members() {
             let Some(glyph) = glyphs.get(index) else { continue };
             let page_baseline = baseline_of(glyph, lines);
             if let Some(b) = baseline_in_prototype(anchor[1], page_baseline, glyph.component.centroid[1]) {
-                prototype_baselines.push(b);
+                let is_refined = line_index(&glyph.role).and_then(|l| refined_lines.get(l).copied()).unwrap_or(false);
+                if is_refined {
+                    refined_baselines.push(b);
+                }
+                all_baselines.push(b);
             }
         }
-        let Some(baseline) = median(&mut prototype_baselines) else {
+        let Some(baseline) = median(&mut refined_baselines).or_else(|| median(&mut all_baselines)) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
@@ -462,11 +531,22 @@ fn masters_of(
             if !origin_x.is_finite() {
                 continue;
             }
-            let (line, word) = word_ref(&glyph.role).unwrap_or((usize::MAX, usize::MAX));
+            let (line, word) = match word_ref(&glyph.role) {
+                Some((l, w)) => (Some(l), Some(w)),
+                None => (None, None),
+            };
+            let is_refined = line.and_then(|l| refined_lines.get(l).copied()).unwrap_or(false);
+            // Refined lines snap every glyph to the line's measured baseline. On an unrefined
+            // line (e.g. only descender glyphs with no baseline anchor), keep the glyph centred
+            // on its scanned vertical centroid so it is never shifted down by a descender box.
+            let y_down = if is_refined { baseline_of(glyph, lines) } else { centroid[1] + (baseline - anchor[1]) };
+            if !y_down.is_finite() {
+                continue;
+            }
             shows.push(Occurrence {
                 line,
                 word,
-                y_down: baseline_of(glyph, lines),
+                y_down,
                 origin_x,
                 text: text.to_string(),
                 bounds: glyph.component.bounds,
@@ -479,7 +559,7 @@ fn masters_of(
         }
         masters.push(Master { glyph: Type3Glyph { text: text.to_string(), outline, baseline, advance }, shows });
     }
-    let cap = PER_FONT.saturating_mul(MAX_FONTS);
+    let cap = FIRST_FONT_MASTERS.saturating_add(PER_FONT.saturating_mul(MAX_FONTS.saturating_sub(1)));
     if masters.len() > cap {
         skipped = skipped.saturating_add(masters.len() - cap);
         masters.truncate(cap);
@@ -554,8 +634,10 @@ fn xy_order_lines(indices: &[usize], lines: &[AnnotatedLine], rects: &[[f32; 4]]
         }
         let next_left = by_x.get(split).and_then(|&idx| rects.get(idx)).map_or(f32::NEG_INFINITY, |r| r[0]);
         if max_right <= next_left {
-            xy_order_lines(&by_x[..split], lines, rects, depth + 1, out);
-            xy_order_lines(&by_x[split..], lines, rects, depth + 1, out);
+            if let (Some(left), Some(right)) = (by_x.get(..split), by_x.get(split..)) {
+                xy_order_lines(left, lines, rects, depth + 1, out);
+                xy_order_lines(right, lines, rects, depth + 1, out);
+            }
             return;
         }
     }
@@ -574,8 +656,10 @@ fn xy_order_lines(indices: &[usize], lines: &[AnnotatedLine], rects: &[[f32; 4]]
         }
         let next_top = by_y.get(split).and_then(|&idx| rects.get(idx)).map_or(f32::NEG_INFINITY, |r| r[1]);
         if max_bottom <= next_top {
-            xy_order_lines(&by_y[..split], lines, rects, depth + 1, out);
-            xy_order_lines(&by_y[split..], lines, rects, depth + 1, out);
+            if let (Some(top), Some(bottom)) = (by_y.get(..split), by_y.get(split..)) {
+                xy_order_lines(top, lines, rects, depth + 1, out);
+                xy_order_lines(bottom, lines, rects, depth + 1, out);
+            }
             return;
         }
     }
@@ -622,12 +706,20 @@ struct Placed {
     font: usize,
     code: u8,
     origin: [f64; 2],
+    advance: f64,
     size: f64,
     color: [u8; 3],
-    line: usize,
-    word: usize,
+    line: Option<usize>,
+    word: Option<usize>,
     y_down: f64,
     text: String,
+}
+
+#[derive(Clone, Copy)]
+struct SpaceGlyph {
+    font: usize,
+    code: u8,
+    size: f64,
 }
 
 struct ComposeFrame<'a> {
@@ -663,15 +755,30 @@ fn compose(
     let mut placed = Vec::new();
     let mut doc = Document::new_empty();
     let mut font_ids = Vec::new();
+    let mut space_glyph = None;
     if !masters.is_empty() {
         if !size.is_finite() || size <= 0.0 || size > MAX_USER {
             return Err(clearscan_err(format!("the font size must be a finite number in (0, {MAX_USER}], got {size}")));
         }
-        for (font_index, chunk) in masters.chunks(PER_FONT).enumerate() {
-            let glyphs: Vec<Type3Glyph> = chunk.iter().map(|master| master.glyph.clone()).collect();
+        let first_len = masters.len().min(FIRST_FONT_MASTERS);
+        let first_chunk = masters.get(..first_len).unwrap_or(&[]);
+        let rest = masters.get(first_len..).unwrap_or(&[]);
+        let font_chunks = std::iter::once(first_chunk).chain(rest.chunks(PER_FONT));
+        for (font_index, chunk) in font_chunks.enumerate() {
+            let mut glyphs: Vec<Type3Glyph> = chunk.iter().map(|master| master.glyph.clone()).collect();
+            let has_space = font_index == 0;
+            if has_space {
+                // Append an invisible U+0020 space charproc in F1 so the PDF content stream and
+                // ToUnicode CMap carry explicit word spaces instead of relying on gap heuristics.
+                glyphs.push(Type3Glyph { text: " ".into(), outline: GlyphOutline::default(), baseline: 0.0, advance: (em * 0.25).max(1.0) });
+            }
             let written = synthesize_type3(&mut doc, &glyphs, &metrics)?;
+            if has_space && let Some(&code) = written.codes.get(chunk.len()) {
+                space_glyph = Some(SpaceGlyph { font: font_index, code, size });
+            }
             for (glyph_index, master) in chunk.iter().enumerate() {
                 let Some(&code) = written.codes.get(glyph_index) else { continue };
+                let advance = master.glyph.advance * points_per_pixel;
                 for show in &master.shows {
                     let Some(origin) = show_origin(show, height_px, points_per_pixel) else { continue };
                     let color = sample_ink_color(raster, show.bounds, show.mask.as_ref(), frame.page_mask);
@@ -679,6 +786,7 @@ fn compose(
                         font: font_index,
                         code,
                         origin,
+                        advance,
                         size,
                         color,
                         line: show.line,
@@ -692,14 +800,7 @@ fn compose(
         }
     }
     let ranks = line_reading_ranks(lines);
-    placed.sort_by(|a, b| {
-        let ra = ranks.get(a.line).copied().unwrap_or(usize::MAX);
-        let rb = ranks.get(b.line).copied().unwrap_or(usize::MAX);
-        ra.cmp(&rb)
-            .then_with(|| a.word.cmp(&b.word))
-            .then_with(|| a.origin[0].partial_cmp(&b.origin[0]).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| a.y_down.partial_cmp(&b.y_down).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    sort_placed(&mut placed, &ranks);
     let width = f64::from(cleaned.raster().width()) * points_per_pixel;
     let height = height_px * points_per_pixel;
     let placement = match frame.geometry {
@@ -707,7 +808,9 @@ fn compose(
         None => None,
     };
     let image = embed_background(&mut doc, &cleaned, encoding)?;
-    let pdf = write_page(&mut doc, &image, &font_ids, &placed, width, height, placement)?;
+    let text_layer = TextLayer { fonts: &font_ids, placed: &placed, space_glyph };
+    let layout = PageLayout { width, height, placement };
+    let pdf = write_page(&mut doc, &image, &text_layer, layout)?;
     let text_out = joined_placed_text(&placed);
     let placements: Vec<GlyphPlacement> = placed
         .iter()
@@ -723,24 +826,56 @@ fn compose(
     Ok(ClearScanOutput { pdf, text: text_out, glyphs, clusters: masters.len(), skipped_clusters, erased, width, height, placements })
 }
 
+fn sort_placed(placed: &mut [Placed], ranks: &[usize]) {
+    placed.sort_by(|a, b| match (a.line, b.line) {
+        (Some(la), Some(lb)) => {
+            let ra = ranks.get(la).copied().unwrap_or(usize::MAX);
+            let rb = ranks.get(lb).copied().unwrap_or(usize::MAX);
+            ra.cmp(&rb)
+                .then_with(|| a.word.cmp(&b.word))
+                .then_with(|| a.origin[0].partial_cmp(&b.origin[0]).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.y_down.partial_cmp(&b.y_down).unwrap_or(std::cmp::Ordering::Equal))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a
+            .y_down
+            .partial_cmp(&b.y_down)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.origin[0].partial_cmp(&b.origin[0]).unwrap_or(std::cmp::Ordering::Equal)),
+    });
+}
+
 /// Reconstruct plain text from sorted placements, inserting a space between words on the same
-/// line and a newline between lines.
+/// line and a newline between lines. Unmatched glyphs (`line: None`) never collapse into one word.
 fn joined_placed_text(placed: &[Placed]) -> String {
     let mut out = String::new();
-    let mut prev: Option<(usize, usize)> = None;
+    let mut prev: Option<(Option<usize>, Option<usize>, f64)> = None;
     for show in placed {
         if show.text.is_empty() {
             continue;
         }
-        if let Some((prev_line, prev_word)) = prev {
-            if show.line != prev_line {
-                out.push('\n');
-            } else if show.word != prev_word {
-                out.push(' ');
+        if let Some((prev_line, prev_word, prev_y)) = prev {
+            match (prev_line, show.line) {
+                (Some(pl), Some(sl)) => {
+                    if sl != pl {
+                        out.push('\n');
+                    } else if show.word != prev_word {
+                        out.push(' ');
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) => out.push('\n'),
+                (None, None) => {
+                    if (show.y_down - prev_y).abs() > 2.0 {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                }
             }
         }
         out.push_str(&show.text);
-        prev = Some((show.line, show.word));
+        prev = Some((show.line, show.word, show.y_down));
     }
     out
 }
@@ -776,6 +911,9 @@ fn erase_regions<'a>(masters: &'a [Master], height_px: f64, points_per_pixel: f6
 }
 
 fn deskewed_raster(pixels: &[u8], width: u32, height: u32, channels: u32, page: &PreprocessedPage) -> Result<PageRaster, OcrError> {
+    if !matches!(channels, 1 | 3 | 4) {
+        return Err(clearscan_err(format!("expected 1, 3 or 4 bytes per pixel, got {channels}")));
+    }
     let dest_w = page.grey.width();
     let dest_h = page.grey.height();
     if channels == 1 {
@@ -791,14 +929,16 @@ fn deskewed_raster(pixels: &[u8], width: u32, height: u32, channels: u32, page: 
     };
     if page.angle_radians == 0.0 && dest_w == width && dest_h == height && page.to_original == crate::deskew::Affine::IDENTITY {
         let mut data = Vec::with_capacity(out_len);
-        for chunk in pixels.chunks_exact(channels as usize) {
-            if channels == 4 {
-                let fade = u8::MAX - chunk[3];
-                data.push(chunk[0].saturating_add(fade));
-                data.push(chunk[1].saturating_add(fade));
-                data.push(chunk[2].saturating_add(fade));
-            } else {
-                data.extend_from_slice(&chunk[..3]);
+        if channels == 4 {
+            for &[r, g, b, a] in pixels.as_chunks::<4>().0 {
+                let fade = u8::MAX - a;
+                data.push(r.saturating_add(fade));
+                data.push(g.saturating_add(fade));
+                data.push(b.saturating_add(fade));
+            }
+        } else {
+            for &[r, g, b] in pixels.as_chunks::<3>().0 {
+                data.extend_from_slice(&[r, g, b]);
             }
         }
         return PageRaster::from_pixels(dest_w, dest_h, stored, &data);
@@ -916,18 +1056,28 @@ fn clearscan_to_user_matrix(
     Ok(m_user)
 }
 
-fn write_page(
-    doc: &mut Document,
-    image: &crate::background::BackgroundImage,
-    fonts: &[pdfcraft_cos::ObjRef],
-    placed: &[Placed],
+struct TextLayer<'a> {
+    fonts: &'a [pdfcraft_cos::ObjRef],
+    placed: &'a [Placed],
+    space_glyph: Option<SpaceGlyph>,
+}
+
+struct PageLayout {
     width: f64,
     height: f64,
     placement: Option<([f64; 4], [f64; 6])>,
-) -> Result<Vec<u8>, OcrError> {
-    let image_only =
-        ClearScanLayer { image_name: "Im0", image_width: width, image_height: height, image_origin: [0.0, 0.0], font_name: "F1", glyphs: &[] };
-    let mut content = match placement {
+}
+
+fn write_page(doc: &mut Document, image: &crate::background::BackgroundImage, text: &TextLayer<'_>, layout: PageLayout) -> Result<Vec<u8>, OcrError> {
+    let image_only = ClearScanLayer {
+        image_name: "Im0",
+        image_width: layout.width,
+        image_height: layout.height,
+        image_origin: [0.0, 0.0],
+        font_name: "F1",
+        glyphs: &[],
+    };
+    let mut content = match layout.placement {
         Some(([cx0, cy0, cx1, cy1], [a, b, c, d, e, f])) => {
             let cw = cx1 - cx0;
             let ch = cy1 - cy0;
@@ -936,10 +1086,10 @@ fn write_page(
         None => Vec::new(),
     };
     content.extend(content_stream(&image_only)?);
-    if !placed.is_empty() {
-        content.extend(text_operators(placed));
+    if !text.placed.is_empty() {
+        content.extend(text_operators(text.placed, text.space_glyph));
     }
-    if placement.is_some() {
+    if layout.placement.is_some() {
         content.extend_from_slice(b"\nQ\n");
     }
     let contents = doc.add(Object::Stream(Stream::flate(Dict::new(), &content)));
@@ -952,9 +1102,9 @@ fn write_page(
     xobjects.set(b"Im0".to_vec(), Object::Ref(image.id));
     let mut resources = Dict::new();
     resources.set(b"XObject".to_vec(), Object::Dict(xobjects));
-    if !fonts.is_empty() {
+    if !text.fonts.is_empty() {
         let mut font_dict = Dict::new();
-        for (index, id) in fonts.iter().enumerate() {
+        for (index, id) in text.fonts.iter().enumerate() {
             let name = font_name(index)?;
             font_dict.set(name.into_bytes(), Object::Ref(*id));
         }
@@ -963,7 +1113,7 @@ fn write_page(
     let mut page = Dict::new();
     page.set(b"Type".to_vec(), Object::name("Page"));
     page.set(b"Parent".to_vec(), Object::Ref(pages));
-    page.set(b"MediaBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Real(width), Object::Real(height)]));
+    page.set(b"MediaBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Real(layout.width), Object::Real(layout.height)]));
     page.set(b"Contents".to_vec(), Object::Ref(contents));
     page.set(b"Resources".to_vec(), Object::Dict(resources));
     let page = doc.add(Object::Dict(page));
@@ -984,7 +1134,8 @@ fn font_name(index: usize) -> Result<String, OcrError> {
 }
 
 fn sample_ink_color(raster: &PageRaster, bounds: [u32; 4], mask: Option<&crate::binarize::Bitmap>, page_mask: &crate::binarize::Bitmap) -> [u8; 3] {
-    if raster.channels() != 3 {
+    let channels = raster.channels();
+    if channels != 1 && channels != 3 {
         return [0, 0, 0];
     }
     let [left, top, right, bottom] = bounds;
@@ -994,6 +1145,29 @@ fn sample_ink_color(raster: &PageRaster, bounds: [u32; 4], mask: Option<&crate::
         return [0, 0, 0];
     }
     let matched = mask.filter(|m| m.width() == right - left && m.height() == bottom - top);
+    if channels == 1 {
+        let mut greys = Vec::new();
+        for y in top..bottom {
+            for x in left..right {
+                let is_ink = match matched {
+                    Some(m) => m.is_ink(i64::from(x - left), i64::from(y - top)),
+                    None => page_mask.is_ink(i64::from(x), i64::from(y)),
+                };
+                if !is_ink {
+                    continue;
+                }
+                if let Some(&g) = raster.pixel(x, y).and_then(|px| px.first()) {
+                    greys.push(g);
+                }
+            }
+        }
+        if greys.is_empty() {
+            return [0, 0, 0];
+        }
+        greys.sort_unstable();
+        let g = greys.get(greys.len() / 2).copied().unwrap_or(0);
+        return if g <= 96 { [0, 0, 0] } else { [g, g, g] };
+    }
     let mut rs = Vec::new();
     let mut gs = Vec::new();
     let mut bs = Vec::new();
@@ -1020,7 +1194,9 @@ fn sample_ink_color(raster: &PageRaster, bounds: [u32; 4], mask: Option<&crate::
     gs.sort_unstable();
     bs.sort_unstable();
     let mid = rs.len() / 2;
-    let (r, g, b) = (rs[mid], gs[mid], bs[mid]);
+    let r = rs.get(mid).copied().unwrap_or(0);
+    let g = gs.get(mid).copied().unwrap_or(0);
+    let b = bs.get(mid).copied().unwrap_or(0);
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     // Dark neutral ink stays crisp black (`0 g`).
@@ -1028,15 +1204,53 @@ fn sample_ink_color(raster: &PageRaster, bounds: [u32; 4], mask: Option<&crate::
 }
 
 /// The text block from the background writer, for a page that switches fonts. That writer
-/// names one font; past 255 shapes the page uses `F1`, `F2`, and so on, so the block is
+/// names one font; past 254 shapes the page uses `F1`, `F2`, and so on, so the block is
 /// written here. The operators start `q 0 g BT 0 Tr`, switching fill colour when an
-/// occurrence has coloured ink, then `Tf`, `Tm`, and `Tj`.
-fn text_operators(placed: &[Placed]) -> Vec<u8> {
+/// occurrence has coloured or grey ink, then `Tf`, `Tm`, and `Tj` (with explicit U+0020 space
+/// glyphs emitted between distinct words on a line).
+fn text_operators(placed: &[Placed], space_glyph: Option<SpaceGlyph>) -> Vec<u8> {
     let mut out = String::from("q\n0 g\nBT\n0 Tr\n");
     let mut current_font: Option<usize> = None;
     let mut current_size: Option<f64> = None;
     let mut current_color = [0_u8, 0, 0];
+    let mut prev_word: Option<(usize, usize, f64, f64)> = None;
+    let emit_font = |out: &mut String, font: usize, size: f64, current_font: &mut Option<usize>, current_size: &mut Option<f64>| {
+        let switched = *current_font != Some(font) || current_size.is_none_or(|s| (s - size).abs() > 1.0e-4);
+        if switched {
+            let name = format!("F{}", font.saturating_add(1));
+            out.push('/');
+            out.push_str(&name);
+            out.push(' ');
+            out.push_str(&crate::pdf_num(size));
+            out.push_str(" Tf\n");
+            *current_font = Some(font);
+            *current_size = Some(size);
+        }
+    };
+    let emit_show = |out: &mut String, x: f64, y: f64, code: u8| {
+        out.push_str("1 0 0 1 ");
+        out.push_str(&crate::pdf_num(x));
+        out.push(' ');
+        out.push_str(&crate::pdf_num(y));
+        out.push_str(" Tm\n<");
+        out.push_str(&format!("{code:02X}"));
+        out.push_str("> Tj\n");
+    };
     for glyph in placed {
+        if let (Some(line), Some(word)) = (glyph.line, glyph.word) {
+            if let Some((pl, pw, prev_end_x, prev_y)) = prev_word
+                && pl == line
+                && pw != word
+                && let Some(space) = space_glyph
+            {
+                let sx = prev_end_x.min(glyph.origin[0]);
+                emit_font(&mut out, space.font, space.size, &mut current_font, &mut current_size);
+                emit_show(&mut out, sx, prev_y, space.code);
+            }
+            prev_word = Some((line, word, glyph.origin[0] + glyph.advance, glyph.origin[1]));
+        } else {
+            prev_word = None;
+        }
         if glyph.color != current_color {
             if glyph.color == [0, 0, 0] {
                 out.push_str("0 g\n");
@@ -1053,31 +1267,8 @@ fn text_operators(placed: &[Placed]) -> Vec<u8> {
             }
             current_color = glyph.color;
         }
-        let switched = current_font != Some(glyph.font) || current_size.is_none_or(|size| (size - glyph.size).abs() > 1.0e-4);
-        if switched {
-            let name = format!("F{}", glyph.font.saturating_add(1));
-            out.push('/');
-            out.push_str(&name);
-            out.push(' ');
-            out.push_str(&crate::pdf_num(glyph.size));
-            out.push_str(" Tf\n");
-            current_font = Some(glyph.font);
-            current_size = Some(glyph.size);
-        }
-        out.push_str(&crate::pdf_num(1.0));
-        out.push(' ');
-        out.push_str(&crate::pdf_num(0.0));
-        out.push(' ');
-        out.push_str(&crate::pdf_num(0.0));
-        out.push(' ');
-        out.push_str(&crate::pdf_num(1.0));
-        out.push(' ');
-        out.push_str(&crate::pdf_num(glyph.origin[0]));
-        out.push(' ');
-        out.push_str(&crate::pdf_num(glyph.origin[1]));
-        out.push_str(" Tm\n<");
-        out.push_str(&format!("{:02X}", glyph.code));
-        out.push_str("> Tj\n");
+        emit_font(&mut out, glyph.font, glyph.size, &mut current_font, &mut current_size);
+        emit_show(&mut out, glyph.origin[0], glyph.origin[1], glyph.code);
     }
     out.push_str("ET\nQ\n");
     out.into_bytes()
@@ -1612,5 +1803,298 @@ mod tests {
         assert!(text.error.is_none(), "{:?}", text.error);
         let plain = text.text.as_ref().map(|page| page.plain_text()).unwrap_or_default();
         assert_eq!(plain, "HI TO\nGO");
+    }
+
+    #[test]
+    fn pdf_text_stream_and_tounicode_contain_explicit_u0020_spaces() {
+        let (width, height) = (180_u32, 120_u32);
+        // Tightly spaced words ("HI" at x=20..24, 26..30 and "TO" at x=32..36, 38..42 — only a 2 px gap).
+        let pixels = marked_page(width, height, &[[20, 20, 24, 40], [26, 20, 30, 40], [32, 20, 36, 40], [38, 20, 42, 40]]);
+        let out = clearscan_image(
+            ScanRaster { pixels: &pixels, width, height, channels: 1, points_per_pixel: 1.0 },
+            &tuned(1, 1.0),
+            |_| {
+                let word = |w: &str, c0: (char, f32, f32), c1: (char, f32, f32)| AnnotatedWord {
+                    text: w.into(),
+                    rect: [c0.1, 20.0, c1.2, 40.0],
+                    chars: vec![CharBox { char: c0.0, rect: [c0.1, 20.0, c0.2, 40.0] }, CharBox { char: c1.0, rect: [c1.1, 20.0, c1.2, 40.0] }],
+                };
+                Ok(vec![AnnotatedLine {
+                    words: vec![word("HI", ('H', 20.0, 24.0), ('I', 26.0, 30.0)), word("TO", ('T', 32.0, 36.0), ('O', 38.0, 42.0))],
+                    baseline: 40.0,
+                    x_height: 10.0,
+                    cap_height: 20.0,
+                    descent: 0.0,
+                }])
+            },
+            no_progress,
+        )
+        .expect("explicit pdf space");
+
+        // Verify F1's /ToUnicode CMap maps a glyph code to <0020> and the page stream emits it.
+        let cos = Document::open(Arc::new(out.pdf.clone())).expect("open pdf");
+        let root = cos.trailer().reference(b"Root").expect("root");
+        let pages_ref = cos.dict(&Object::Ref(root)).expect("catalog").reference(b"Pages").expect("pages");
+        let pages_dict = cos.dict(&Object::Ref(pages_ref)).expect("pages dict");
+        let kids = pages_dict.get(b"Kids").expect("kids");
+        let first_page_ref = cos.resolve(kids).as_array().expect("kids array").first().and_then(Object::as_ref).expect("first page ref");
+        let page = cos.dict(&Object::Ref(first_page_ref)).expect("page dict");
+        let res = cos.dict(page.get(b"Resources").expect("resources")).expect("res dict");
+        let fonts = cos.dict(res.get(b"Font").expect("font dict")).expect("fonts");
+        let f1 = cos.dict(fonts.get(b"F1").expect("F1")).expect("F1 dict");
+        let to_unicode = f1.get(b"ToUnicode").expect("ToUnicode");
+        let cmap_stream = match cos.resolve(to_unicode).as_ref() {
+            Object::Stream(s) => String::from_utf8_lossy(&s.decoded().expect("decode cmap")).into_owned(),
+            other => panic!("expected ToUnicode stream, got {other:?}"),
+        };
+        let space_line = cmap_stream.lines().find(|l| l.contains("<0020>")).expect("ToUnicode CMap must contain <0020>");
+        let space_hex = space_line.split_whitespace().next().expect("space code token");
+        let contents_stream = match cos.resolve(page.get(b"Contents").expect("Contents")).as_ref() {
+            Object::Stream(s) => String::from_utf8_lossy(&s.decoded().expect("decode contents")).into_owned(),
+            other => panic!("expected Contents stream, got {other:?}"),
+        };
+        assert!(contents_stream.contains(&format!("{space_hex} Tj")), "content stream missing explicit space {space_hex} Tj:\n{contents_stream}");
+
+        let mut renderer = PageRenderer::new(Arc::new(out.pdf), RenderConfig::default());
+        let text = renderer.render(RenderRequest { page: 0, kind: RequestKind::Text, scale: 1.0, ..RenderRequest::default() });
+        assert!(text.error.is_none(), "{:?}", text.error);
+        let plain = text.text.as_ref().map(|page| page.plain_text()).unwrap_or_default();
+        assert_eq!(plain, "HI TO", "tightly spaced words must extract with a single explicit space");
+    }
+
+    #[test]
+    fn grey_lettering_on_1ch_scan_keeps_its_grey_tone() {
+        let (width, height) = (180_u32, 140_u32);
+        let mut pixels = vec![250_u8; (width * height) as usize];
+        // Draw a medium-grey stem [30..36, 40..68] (luma 140 on 250 paper).
+        for y in 40..68_usize {
+            for x in 30..36_usize {
+                pixels[y * width as usize + x] = 140;
+            }
+        }
+        let out = clearscan_image(
+            ScanRaster { pixels: &pixels, width, height, channels: 1, points_per_pixel: 1.0 },
+            &tuned(1, 1.0),
+            lines_for_left_ink,
+            no_progress,
+        )
+        .expect("grey 1ch lettering");
+        assert_eq!(out.text, "H");
+        let mut renderer = PageRenderer::new(Arc::new(out.pdf), RenderConfig::default());
+        let rendered = renderer.render(RenderRequest { page: 0, kind: RequestKind::Pixels, scale: 1.0, ..RenderRequest::default() });
+        assert!(rendered.error.is_none(), "{:?}", rendered.error);
+        let idx = (54_usize * rendered.width as usize + 33) * 4;
+        let g = rendered.rgba[idx];
+        assert!((115..=165).contains(&g), "expected medium grey (~140) glyph fill, got {g}");
+    }
+
+    #[test]
+    fn descender_line_with_whole_line_char_boxes_keeps_true_baseline_on_both_lines() {
+        let (width, height) = (220_u32, 160_u32);
+        // Line 0 ("gap"): 'g' [20..26, 25..55] (descender), 'a' [34..40, 25..40], 'p' [48..54, 25..55] (descender).
+        // Line 1 ("cat"): 'c' [20..26, 85..100], 'a' [34..40, 85..100], 't' [48..54, 80..100].
+        // Real ocrs slices the whole line box vertically, so every CharBox on line 0 gets bottom = 55!
+        let pixels = marked_page(
+            width,
+            height,
+            &[[20, 25, 26, 55], [34, 25, 40, 40], [48, 25, 54, 55], [20, 85, 26, 100], [34, 85, 40, 100], [48, 80, 54, 100]],
+        );
+        let out = clearscan_image(
+            ScanRaster { pixels: &pixels, width, height, channels: 1, points_per_pixel: 1.0 },
+            &tuned(1, 1.0),
+            |_| {
+                let line0 = AnnotatedLine::measure(vec![AnnotatedWord {
+                    text: "gap".into(),
+                    rect: [20.0, 25.0, 54.0, 55.0],
+                    chars: vec![
+                        CharBox { char: 'g', rect: [20.0, 25.0, 26.0, 55.0] },
+                        CharBox { char: 'a', rect: [34.0, 25.0, 40.0, 55.0] },
+                        CharBox { char: 'p', rect: [48.0, 25.0, 54.0, 55.0] },
+                    ],
+                }]);
+                // Without component-based baseline refinement, line0.baseline is 55.0 (descender bottom).
+                assert_eq!(line0.baseline, 55.0);
+                let line1 = AnnotatedLine::measure(vec![AnnotatedWord {
+                    text: "cat".into(),
+                    rect: [20.0, 80.0, 54.0, 100.0],
+                    chars: vec![
+                        CharBox { char: 'c', rect: [20.0, 80.0, 26.0, 100.0] },
+                        CharBox { char: 'a', rect: [34.0, 80.0, 40.0, 100.0] },
+                        CharBox { char: 't', rect: [48.0, 80.0, 54.0, 100.0] },
+                    ],
+                }]);
+                Ok(vec![line0, line1])
+            },
+            no_progress,
+        )
+        .expect("descender line baseline refinement");
+
+        let mut renderer = PageRenderer::new(Arc::new(out.pdf), RenderConfig::default());
+        let rendered = renderer.render(RenderRequest { page: 0, kind: RequestKind::Pixels, scale: 1.0, ..RenderRequest::default() });
+        assert!(rendered.error.is_none(), "{:?}", rendered.error);
+        let sample = |x: u32, y: u32| -> u8 {
+            let idx = (y as usize * rendered.width as usize + x as usize) * 4;
+            rendered.rgba[idx]
+        };
+        // Line 0 ('a' at y=25..40): must stay dark inside 25..40 and white at y=48 (NOT shifted down by 15 px).
+        assert!(sample(37, 32) < 80, "line 0 'a' must remain at y=32, got {}", sample(37, 32));
+        assert!(sample(37, 48) > 200, "line 0 'a' must not drop to y=48, got {}", sample(37, 48));
+        // Line 0 ('g' at y=25..55): both top and descender tail must stay dark.
+        assert!(sample(23, 32) < 80, "line 0 'g' body must stay dark at y=32, got {}", sample(23, 32));
+        assert!(sample(23, 50) < 80, "line 0 'g' tail must stay dark at y=50, got {}", sample(23, 50));
+        // Line 1 ('a' at y=85..100): must stay dark at y=92 and white at y=108.
+        assert!(sample(37, 92) < 80, "line 1 'a' must remain at y=92, got {}", sample(37, 92));
+        assert!(sample(37, 108) > 200, "line 1 'a' must not drop to y=108, got {}", sample(37, 108));
+    }
+
+    #[test]
+    fn real_ocrs_descender_line_keeps_true_baseline() {
+        let Ok(ocr) = Ocr::find() else { return };
+        // Build a simple Helvetica PDF with line 0 ("gap dog peg") where every word has a descender,
+        // and line 1 ("cat hat mat") with no descenders.
+        let mut doc = Document::new_empty();
+        let root = doc.trailer().reference(b"Root").expect("root");
+        let pages = doc.dict(&Object::Ref(root)).expect("cat").reference(b"Pages").expect("pages");
+        let font = doc.add(Object::Dict({
+            let mut d = Dict::new();
+            d.set(b"Type".to_vec(), Object::name("Font"));
+            d.set(b"Subtype".to_vec(), Object::name("Type1"));
+            d.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
+            d
+        }));
+        let mut font_res = Dict::new();
+        font_res.set(b"F1".to_vec(), Object::Ref(font));
+        let mut res = Dict::new();
+        res.set(b"Font".to_vec(), Object::Dict(font_res));
+        let stream = doc.add(Object::Stream(Stream::flate(
+            Dict::new(),
+            b"1 1 1 rg 0 0 320 120 re f 0 0 0 rg BT /F1 18 Tf 24 84 Td (gap dog peg) Tj 0 -36 Td (cat hat mat) Tj ET\n",
+        )));
+        let mut page = Dict::new();
+        page.set(b"Type".to_vec(), Object::name("Page"));
+        page.set(b"Parent".to_vec(), Object::Ref(pages));
+        page.set(b"MediaBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(320), Object::Int(120)]));
+        page.set(b"Resources".to_vec(), Object::Dict(res));
+        page.set(b"Contents".to_vec(), Object::Ref(stream));
+        let page_ref = doc.add(Object::Dict(page));
+        doc.update_dict(pages, |d| {
+            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+            d.set(b"Count".to_vec(), Object::Int(1));
+        })
+        .expect("set pages");
+        let src_pdf = Arc::new(write_full(&doc, &SaveOptions::default()).expect("write src"));
+        let mut src_renderer = PageRenderer::new(src_pdf, RenderConfig::default());
+        let before = src_renderer.render(RenderRequest { page: 0, kind: RequestKind::Pixels, scale: 3.0, ..RenderRequest::default() });
+        assert!(before.error.is_none(), "{:?}", before.error);
+
+        let out = clearscan_recognized(
+            &ocr,
+            ScanRaster { pixels: &before.rgba, width: before.width, height: before.height, channels: 4, points_per_pixel: 1.0 / 3.0 },
+            &tuned(1, 1.0),
+            no_progress,
+        )
+        .expect("real ocrs clearscan");
+        assert!(out.glyphs >= 6, "expected recognized glyphs, got {}", out.glyphs);
+
+        let mut after_renderer = PageRenderer::new(Arc::new(out.pdf), RenderConfig::default());
+        let after = after_renderer.render(RenderRequest { page: 0, kind: RequestKind::Pixels, scale: 3.0, ..RenderRequest::default() });
+        assert!(after.error.is_none(), "{:?}", after.error);
+
+        // Compare vertical ink centroids of the top half (line 0: "gap dog peg") and bottom half
+        // (line 1: "cat hat mat"): both lines must stay within 2 px of their original vertical centroid.
+        let band_cy = |img: &pdfcraft_render::RenderedPage, y0: u32, y1: u32| -> (usize, f64) {
+            let mut count = 0_usize;
+            let mut sum_y = 0.0_f64;
+            for y in y0..y1.min(img.height) {
+                for x in 0..img.width {
+                    let idx = (y as usize * img.width as usize + x as usize) * 4;
+                    if img.rgba[idx] < 128 {
+                        count += 1;
+                        sum_y += f64::from(y);
+                    }
+                }
+            }
+            (count, if count > 0 { sum_y / count as f64 } else { 0.0 })
+        };
+        let mid_y = before.height / 2;
+        let (b0_n, b0_cy) = band_cy(&before, 0, mid_y);
+        let (a0_n, a0_cy) = band_cy(&after, 0, mid_y);
+        let (b1_n, b1_cy) = band_cy(&before, mid_y, before.height);
+        let (a1_n, a1_cy) = band_cy(&after, mid_y, after.height);
+        assert!(b0_n > 100 && a0_n > 100, "line 0 ink missing: before={b0_n}, after={a0_n}");
+        assert!(b1_n > 100 && a1_n > 100, "line 1 ink missing: before={b1_n}, after={a1_n}");
+        assert!((a0_cy - b0_cy).abs() <= 2.0, "descender line 0 shifted vertically: before={b0_cy:.2}, after={a0_cy:.2}");
+        assert!((a1_cy - b1_cy).abs() <= 2.0, "normal line 1 shifted vertically: before={b1_cy:.2}, after={a1_cy:.2}");
+    }
+
+    #[test]
+    fn unmatched_placements_sort_by_y_then_x_and_do_not_merge_into_one_word() {
+        let mk = |line: Option<usize>, word: Option<usize>, x: f64, y_down: f64, text: &str| Placed {
+            font: 0,
+            code: 1,
+            origin: [x, 100.0 - y_down],
+            advance: 6.0,
+            size: 12.0,
+            color: [0, 0, 0],
+            line,
+            word,
+            y_down,
+            text: text.into(),
+        };
+        let mut placed = vec![
+            mk(None, None, 10.0, 80.0, "Z"),
+            mk(None, None, 50.0, 20.0, "X"),
+            mk(None, None, 60.0, 20.0, "Y"),
+            mk(Some(0), Some(0), 10.0, 20.0, "A"),
+        ];
+        sort_placed(&mut placed, &[0]);
+        let seq: Vec<&str> = placed.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(seq, vec!["A", "X", "Y", "Z"]);
+        assert_eq!(joined_placed_text(&placed), "A\nX Y\nZ");
+    }
+
+    #[test]
+    fn more_than_254_masters_splits_into_f2_while_keeping_space_in_f1() {
+        let raster = PageRaster::from_pixels(64, 64, 1, &vec![250_u8; 64 * 64]).expect("raster");
+        let page_mask = crate::binarize::Bitmap::from_ink(64, 64, vec![0_u8; 64 * 64]).expect("mask");
+        let lines = vec![AnnotatedLine { words: Vec::new(), baseline: 20.0, x_height: 8.0, cap_height: 12.0, descent: 2.0 }];
+        let masters: Vec<Master> = (0..255_usize)
+            .map(|i| Master {
+                glyph: Type3Glyph { text: "a".into(), outline: GlyphOutline::default(), baseline: 10.0, advance: 4.0 },
+                shows: vec![Occurrence {
+                    line: Some(0),
+                    word: Some(i),
+                    y_down: 20.0,
+                    origin_x: (i % 10) as f64 * 4.0,
+                    text: "a".into(),
+                    bounds: [0, 0, 2, 2],
+                    mask: None,
+                }],
+            })
+            .collect();
+        let frame = ComposeFrame {
+            points_per_pixel: 1.0,
+            source_ppp: 1.0,
+            to_original: crate::deskew::Affine::IDENTITY,
+            geometry: None,
+            page_mask: &page_mask,
+        };
+        let out = compose(&raster, &[], &masters, &lines, frame, &ClearScanOptions::default(), 0).expect("255 masters split across F1 and F2");
+        assert_eq!(out.clusters, 255);
+        assert_eq!(out.placements.iter().filter(|p| p.font == 1).count(), 254);
+        assert_eq!(out.placements.iter().filter(|p| p.font == 2).count(), 1);
+        let cos = Document::open(Arc::new(out.pdf)).expect("open pdf");
+        let root = cos.trailer().reference(b"Root").expect("root");
+        let pages_ref = cos.dict(&Object::Ref(root)).expect("catalog").reference(b"Pages").expect("pages");
+        let pages_dict = cos.dict(&Object::Ref(pages_ref)).expect("pages dict");
+        let kids = pages_dict.get(b"Kids").expect("kids");
+        let first_page_ref = cos.resolve(kids).as_array().expect("kids array").first().and_then(Object::as_ref).expect("page ref");
+        let page = cos.dict(&Object::Ref(first_page_ref)).expect("page dict");
+        let res = cos.dict(page.get(b"Resources").expect("resources")).expect("res");
+        let fonts = cos.dict(res.get(b"Font").expect("font")).expect("fonts");
+        let f1 = cos.dict(fonts.get(b"F1").expect("F1")).expect("F1 dict");
+        let f2 = cos.dict(fonts.get(b"F2").expect("F2")).expect("F2 dict");
+        assert_eq!(f1.get(b"LastChar").and_then(Object::as_int), Some(255), "F1 holds 254 masters + space = 255");
+        assert_eq!(f2.get(b"LastChar").and_then(Object::as_int), Some(1), "F2 holds the 255th master at code 1");
     }
 }

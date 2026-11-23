@@ -76,8 +76,9 @@ The scan is turned to greyscale, deskewed, and binarized (Sauvola on a page-size
 Otsu on a small one). Connected components separate glyphs from speckles, rules and
 photographs. Glyphs are lined up with the recognised characters, clustered by shape, and
 averaged on their centroids. Each master is traced to cubic Bézier curves and stored as an
-uncolored Type 3 glyph (`d1`, `m`/`l`/`c`/`h`/`f`). A simple font holds 255 drawing glyphs;
-further shapes use `F2`, `F3`, … up to 16 fonts. Past that, extra clusters are counted and
+uncolored Type 3 glyph (`d1`, `m`/`l`/`c`/`h`/`f`). A simple font holds 255 charprocs: `F1`
+holds up to 254 master shapes plus an invisible `U+0020` space glyph, and further shapes use
+`F2`, `F3`, … up to 16 fonts (255 shapes each). Past that, extra clusters are counted and
 left out.
 
 The background is the deskewed scan with each redrawn glyph, plus a one-pixel halo, painted
@@ -88,7 +89,8 @@ page whose colour varies like a photograph is JPEG. There is no JBIG2 encoder in
 tree (the usual one is AGPL), so a monochrome scan stays Flate.
 
 The content stream draws that image, then fills the Type 3 glyphs at each
-occurrence's baseline (black for dark neutral ink, or the occurrence's sampled ink colour).
+occurrence's baseline (black for dark neutral ink, or the occurrence's sampled RGB or grey
+ink colour) with explicit `U+0020` space glyphs emitted between distinct words on a line.
 
 ## Clean-room
 

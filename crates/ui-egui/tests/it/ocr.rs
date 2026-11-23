@@ -86,20 +86,29 @@ fn editable_text_and_images_replaces_a_scan_and_undoes() {
     assert!(h.query_by_label("Downsample").is_none(), "downsample is a ClearScan setting");
     h.get_by(|node| node.role() == Role::ComboBox && node.value().as_deref() == Some("Searchable Image (Exact)")).click();
     h.run_steps(2);
+    h.get_by_label("Editable text and images").hover();
+    let delay = f64::from(h.ctx.global_style().interaction.tooltip_delay);
+    let start = h.ctx.input(|i| i.time);
+    let has_tooltip = |h: &Harness<'static, PdfCraftApp>| {
+        h.query_all_by(|node| {
+            node.label().is_some_and(|label| label.contains("Replaces the lettering with outlines"))
+                || node.value().is_some_and(|value| value.contains("Replaces the lettering with outlines"))
+        })
+        .next()
+        .is_some()
+    };
+    let mut frames = 0;
+    while !has_tooltip(&h) {
+        let elapsed = h.ctx.input(|i| i.time) - start;
+        assert!(elapsed < 4.0 * delay && frames < 100, "the output explains that lettering becomes outlines (no tooltip after {elapsed:.2}s)");
+        h.step();
+        frames += 1;
+    }
     h.get_by_label("Editable text and images").click();
     h.run_steps(2);
     h.get_by_label("Sensitivity");
     h.get_by_label("Downsample");
     assert_eq!((h.state().ocr_draft.sensitivity, h.state().ocr_draft.downsample), (50, 1));
-    h.get_by(|node| node.role() == Role::ComboBox && node.value().as_deref() == Some("Editable text and images")).hover();
-    h.run_steps(4);
-    let hover = h
-        .query_all_by(|node| {
-            node.label().is_some_and(|label| label.contains("Replaces the lettering with outlines"))
-                || node.value().is_some_and(|value| value.contains("Replaces the lettering with outlines"))
-        })
-        .count();
-    assert!(hover >= 1, "the output explains that lettering becomes outlines");
     if pdfcraft_engine::ocr::engine_unavailable_reason(pdfcraft_engine::ocr::EngineChoice::Ocrs).is_some() {
         h.get_by_label_contains("model files are missing");
         eprintln!("skipped: OCR models not installed");
