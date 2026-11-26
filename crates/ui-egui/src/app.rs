@@ -396,6 +396,7 @@ impl PdfCraftApp {
             progress_requests: Vec::new(),
             progress_cards: Default::default(),
             password_prompt: None,
+            print_requests: Vec::new(),
             unlock_prompt: None,
             screen_mode: Default::default(),
             host_dirty: None,
@@ -845,6 +846,7 @@ impl PdfCraftApp {
                 view.session.pending_pick = None;
             }
         }
+        self.open_queued_print();
         panes::frame(self, &ctx);
         // Forms' scripts read Highlight fields as `app.runtimeHighlight`.
         let highlight = self.active.and_then(|i| self.views.get(i)).map_or(self.highlight_fields, |v| v.session.highlight_fields);
