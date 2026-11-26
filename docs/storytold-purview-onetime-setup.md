@@ -401,10 +401,24 @@ or reuse Azure CLI credentials, the Azure CLI client ID, `az login`, or
 The POC obtains protection and policy tokens separately. Use the same work/school account for
 both prompts; sign-in fails if either response lacks an account identifier or they differ. A
 failed attempt to add an account leaves any existing signed-in account available.
-Sign-in and policy loading run outside the UI thread; closing the sign-in window does not
-cancel them. Close protected documents and finish queued opens before switching accounts or
+Sign-in and its initial policy load run outside the UI thread; closing the sign-in window does not
+cancel them. A later policy refresh when opening the labeling dialog or switching accounts may
+still block the interface. Close protected documents and finish queued opens before switching accounts or
 signing out, so rights from one account are not reused for another. If another MIP operation
 is in progress, wait for it to finish and retry the account change.
+Files opened by path during sign-in wait for it to finish. Other PDF open requests are refused
+with a retry message rather than being inspected under an account that is changing.
+If a protected file is denied or unavailable, the dialog identifies the waiting file and offers
+Retry opening once an account is ready; it does not offer actions for a different open document.
+
+The POC does not yet renew expired access tokens or reauthenticate while protected documents
+are open. An SDK operation, protected save, or recovery snapshot can therefore fail after token
+expiry; unsaved changes remain at risk. Do not work around this by exporting plaintext. With
+synthetic fixtures, close or discard the test document and sign in again. Safe same-account
+renewal, challenge handling, preservation of unsaved work, and rights revalidation are release
+blockers and must be tested with a real tenant before use with sensitive documents.
+The unresolved implementation review is tracked in
+[storytold/pdfcraft#7843](https://github.com/storytold/pdfcraft/pull/7843#discussion_r4687045314).
 
 Azure CLI is useful to Storytold maintainers for tenant/app-registration setup
 and Azure resource administration, but it is not the runtime identity for

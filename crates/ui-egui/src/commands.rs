@@ -241,7 +241,7 @@ impl PdfCraftApp {
                 } else {
                     match self.purview_status() {
                         pdfcraft_engine::PurviewStatus::Ready => match self.session.purview_sign_out() {
-                            Ok(()) => self.notify_tr("Signed out"),
+                            Ok(()) => self.finish_purview_sign_out(),
                             Err(error) => self.notify_fmt("Sign-out failed: {e}", &[("e", &error.to_string())]),
                         },
                         pdfcraft_engine::PurviewStatus::SigningIn => self.notify_tr("Wait for Microsoft sign-in to finish"),
@@ -276,24 +276,15 @@ impl PdfCraftApp {
             }
             "purview.apply_label" => {
                 if matches!(self.purview_status(), pdfcraft_engine::PurviewStatus::Ready) {
-                    match self.session.purview_labels() {
-                        Ok(labels) => {
-                            self.purview_labels = labels;
-                            self.purview_label_id = self.purview_labels.first().map(|label| label.id.clone()).unwrap_or_default();
-                            self.purview_justification.clear();
-                            self.dialog = Some(Dialog::Purview);
-                        }
-                        Err(error) => {
-                            self.notify_fmt("Couldn't load Microsoft Purview labels: {e}", &[("e", &error.to_string())]);
-                            self.dialog = Some(Dialog::Purview);
-                        }
+                    let labels = self.session.purview_labels();
+                    if self.update_purview_labels(labels) {
+                        self.purview_label_id = self.purview_labels.first().map(|label| label.id.clone()).unwrap_or_default();
                     }
                 } else {
-                    self.purview_labels.clear();
-                    self.purview_label_id.clear();
-                    self.purview_justification.clear();
-                    self.dialog = Some(Dialog::Purview);
+                    self.clear_purview_labels();
                 }
+                self.purview_justification.clear();
+                self.dialog = Some(Dialog::Purview);
             }
             "purview.remove_label" => match self.active_ids().map(|(_, id)| id) {
                 Some(id) => {

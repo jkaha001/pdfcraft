@@ -26,6 +26,10 @@ struct TestPurviewProvider {
     inspect_document: Option<PurviewDocument>,
     inspect_sign_in_required: bool,
     sign_in_gate: Option<Arc<SignInGate>>,
+    labels_fail: bool,
+    labels: Vec<PurviewLabel>,
+    deny_open: bool,
+    inspect_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl TestPurviewProvider {
@@ -37,6 +41,10 @@ impl TestPurviewProvider {
             inspect_document: None,
             inspect_sign_in_required: false,
             sign_in_gate: None,
+            labels_fail: false,
+            labels: Vec::new(),
+            deny_open: false,
+            inspect_calls: None,
         }
     }
 
@@ -48,6 +56,10 @@ impl TestPurviewProvider {
             inspect_document: None,
             inspect_sign_in_required: true,
             sign_in_gate: None,
+            labels_fail: false,
+            labels: Vec::new(),
+            deny_open: false,
+            inspect_calls: None,
         }
     }
 
@@ -59,6 +71,10 @@ impl TestPurviewProvider {
             inspect_document: None,
             inspect_sign_in_required: false,
             sign_in_gate: None,
+            labels_fail: false,
+            labels: Vec::new(),
+            deny_open: false,
+            inspect_calls: None,
         }
     }
 
@@ -70,6 +86,10 @@ impl TestPurviewProvider {
             inspect_document: Some(document),
             inspect_sign_in_required: false,
             sign_in_gate: None,
+            labels_fail: false,
+            labels: Vec::new(),
+            deny_open: false,
+            inspect_calls: None,
         }
     }
 }
@@ -111,13 +131,24 @@ impl PurviewProvider for TestPurviewProvider {
     }
 
     fn sign_out(&self) -> Result<(), PurviewError> {
-        *self.status.lock().unwrap_or_else(|poison| poison.into_inner()) = PurviewStatus::SignedOut;
-        *self.active.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
-        self.accounts.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
+        let mut active = self.active.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut accounts = self.accounts.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(account) = active.as_ref() {
+            accounts.retain(|candidate| candidate.id != account.id);
+        }
+        *active = accounts.first().cloned();
+        *self.status.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            if active.is_some() { PurviewStatus::Ready } else { PurviewStatus::SignedOut };
         Ok(())
     }
 
     fn inspect(&self, _name: &str, bytes: &Arc<Vec<u8>>) -> Result<Option<PurviewOpen>, PurviewError> {
+        if let Some(calls) = &self.inspect_calls {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.deny_open {
+            return Err(PurviewError::NoAccess);
+        }
         if self.inspect_sign_in_required {
             if self.status() != PurviewStatus::Ready {
                 return Err(PurviewError::SignInRequired);
@@ -133,7 +164,7 @@ impl PurviewProvider for TestPurviewProvider {
     }
 
     fn labels(&self) -> Result<Vec<PurviewLabel>, PurviewError> {
-        Ok(Vec::new())
+        if self.labels_fail { Err(PurviewError::Native("test label service unavailable".into())) } else { Ok(self.labels.clone()) }
     }
 
     fn apply_label(
@@ -273,6 +304,43 @@ fn opening_a_pfile_automatically_opens_the_signed_out_sign_in_gate() {
 }
 
 #[test]
+fn denied_open_shows_a_retry_without_actions_for_the_previous_document() {
+    let account = PurviewAccount { id: "ada".into(), display_name: "Ada".into(), email: "ada@example.com".into(), principal_name: String::new() };
+    let mut provider = TestPurviewProvider::signed_in(account.clone(), vec![account]);
+    provider.deny_open = true;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    provider.inspect_calls = Some(calls.clone());
+    let mut h = harness_closed(provider);
+    h.state_mut().purview_label_id = "previous-label".into();
+    h.state_mut().open_bytes("protected.pfile", None, b"MicrosoftIRMServices Protected PDF".to_vec()).unwrap();
+    h.run_steps(3);
+    h.get_by_label("protected.pfile");
+    h.get_by_label("Retry opening");
+    assert!(h.query_by_label("Sensitivity labels").is_none());
+    assert!(h.query_by_label("Apply label").is_none());
+    assert!(h.query_by_label("Remove label").is_none());
+    h.get_by_label("Retry opening").click();
+    for _ in 0..200 {
+        h.run_steps(1);
+        if calls.load(std::sync::atomic::Ordering::SeqCst) >= 2
+            && h.state().purview_signin_prompt.as_ref().is_some_and(|prompt| prompt.error.is_some())
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let inspected = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        inspected >= 2,
+        "retry inspected {inspected} times; dialog={:?}, pending={:?}",
+        h.state().dialog,
+        h.state().purview_signin_prompt.as_ref().map(|prompt| (&prompt.name, &prompt.error))
+    );
+    assert!(h.state().purview_signin_prompt.as_ref().is_some_and(|prompt| prompt.error.is_some()));
+    assert_eq!(h.state().session.docs().len(), 1);
+}
+
+#[test]
 fn microsoft_sign_in_does_not_block_the_ui() {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -295,6 +363,38 @@ fn microsoft_sign_in_does_not_block_the_ui() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     h.get_by_label("Sensitivity labels");
+}
+
+#[test]
+fn protected_open_waits_for_an_in_progress_account_change() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let account = PurviewAccount { id: "ada".into(), display_name: "Ada".into(), email: "ada@example.com".into(), principal_name: String::new() };
+    let document = PurviewDocument { protected: true, rights: PurviewRights { view: true, ..Default::default() }, ..Default::default() };
+    let mut provider = TestPurviewProvider::signed_in_with_document(account.clone(), vec![account], document);
+    provider.sign_in_gate = Some(Arc::new(SignInGate { started: started_tx, release: Mutex::new(release_rx) }));
+    let mut h = harness_closed(provider);
+    assert!(h.state_mut().execute("purview.sign_in"));
+    started_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("sign-in worker started");
+    let error = h.state_mut().open_bytes("protected.pdf", None, FIXTURE.to_vec()).unwrap_err();
+    assert!(error.contains("sign-in is in progress"));
+
+    let path = std::env::temp_dir().join(format!("pdfcraft-purview-sign-in-{}.pdf", std::process::id()));
+    std::fs::write(&path, FIXTURE).unwrap();
+    assert_eq!(h.state_mut().open_path(&path.to_string_lossy()), pdfcraft_ui_egui::OpenOutcome::Pending);
+    h.run_steps(3);
+    assert_eq!(h.state().session.docs().len(), 1);
+    release_tx.send(()).unwrap();
+    for _ in 0..200 {
+        h.run_steps(1);
+        if h.state().session.docs().len() == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let opened = h.state().session.docs().len();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(opened, 2);
 }
 
 #[test]
@@ -368,6 +468,20 @@ fn security_properties_do_not_claim_a_protected_document_is_unrestricted() {
 }
 
 #[test]
+fn protected_security_properties_separate_edit_save_export_and_security() {
+    let account = PurviewAccount { id: "ada".into(), display_name: "Ada".into(), email: "ada@example.com".into(), principal_name: String::new() };
+    let document = PurviewDocument {
+        protected: true,
+        rights: PurviewRights { view: true, save: true, change_rights: true, ..Default::default() },
+        ..Default::default()
+    };
+    let h = harness_security_with_document(TestPurviewProvider::signed_in_with_document(account.clone(), vec![account], document));
+    for label in ["MIP edit", "MIP save", "MIP export", "MIP change security"] {
+        h.get_by_label(label);
+    }
+}
+
+#[test]
 fn signed_in_dialog_shows_display_name_and_email_and_replaces_sign_in_with_sign_out() {
     let ada = PurviewAccount {
         id: "ada".into(),
@@ -423,6 +537,62 @@ fn two_signed_in_accounts_have_an_account_picker() {
     h.run_steps(3);
     h.get_by_label("Grace Hopper");
     h.get_by_label("grace@example.com");
+}
+
+#[test]
+fn failed_label_loading_does_not_show_stale_or_empty_policy() {
+    let account = PurviewAccount { id: "ada".into(), display_name: "Ada".into(), email: "ada@example.com".into(), principal_name: String::new() };
+    let mut provider = TestPurviewProvider::signed_in(account.clone(), vec![account]);
+    provider.labels_fail = true;
+    let mut h = harness_closed(provider);
+    h.state_mut().purview_labels = vec![PurviewLabel {
+        id: "old-label".into(),
+        name: "Old account label".into(),
+        description: String::new(),
+        tooltip: String::new(),
+        color: None,
+        parent_id: None,
+        sensitivity: 0,
+        active: true,
+        protection: false,
+    }];
+    h.state_mut().purview_label_id = "old-label".into();
+    assert!(h.state_mut().execute("purview.apply_label"));
+    h.run_steps(3);
+    assert!(h.state().purview_labels.is_empty());
+    assert!(h.state().purview_label_id.is_empty());
+    assert!(h.query_by_label("Old account label - Label only").is_none());
+    assert!(h.query_by_label("No sensitivity labels are available to this account or tenant policy.").is_none());
+    h.get_by_label("test label service unavailable");
+}
+
+#[test]
+fn signing_out_loads_the_remaining_accounts_labels() {
+    let ada = PurviewAccount { id: "ada".into(), display_name: "Ada".into(), email: "ada@example.com".into(), principal_name: String::new() };
+    let grace = PurviewAccount { id: "grace".into(), display_name: "Grace".into(), email: "grace@example.com".into(), principal_name: String::new() };
+    let label = |id: &str, name: &str| PurviewLabel {
+        id: id.into(),
+        name: name.into(),
+        description: String::new(),
+        tooltip: String::new(),
+        color: None,
+        parent_id: None,
+        sensitivity: 0,
+        active: true,
+        protection: false,
+    };
+    let mut provider = TestPurviewProvider::signed_in(ada.clone(), vec![ada, grace]);
+    provider.labels = vec![label("grace-label", "Grace label")];
+    let mut h = harness(provider);
+    h.state_mut().purview_labels = vec![label("ada-label", "Ada label")];
+    h.state_mut().purview_justification = "old account reason".into();
+    h.run_steps(3);
+    h.get_by_label("Sign out").click();
+    h.run_steps(3);
+    h.get_by_label("Grace");
+    h.get_by_label("Grace label - Label only");
+    assert!(h.query_by_label("Ada label - Label only").is_none());
+    assert!(h.state().purview_justification.is_empty());
 }
 
 #[test]
@@ -563,7 +733,12 @@ fn protected_label_actions_are_unavailable_even_with_owner_rights() {
     assert!(h.query_by(|node| node.label().as_deref() == Some("Remove label")).is_none());
     assert!(h.query_by(|node| node.label().as_deref() == Some("Remove protection")).is_none());
 
-    let label_only = PurviewDocument { protected: false, default_label_id: Some("other-default".into()), ..document };
+    let label_only = PurviewDocument {
+        protected: false,
+        rights: PurviewRights { view: true, ..Default::default() },
+        default_label_id: Some("other-default".into()),
+        ..document
+    };
     let h = harness_with_document(TestPurviewProvider::signed_in_with_document(ada.clone(), vec![ada], label_only));
     h.get_by_label("Remove label");
     h.get_by_label("Add account");

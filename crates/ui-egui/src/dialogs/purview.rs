@@ -33,12 +33,16 @@ pub(super) fn properties(
     if let Some(owner) = purview.owner.as_ref().filter(|owner| !owner.trim().is_empty()) {
         row(ui, "Microsoft Purview owner", owner.clone());
     }
-    let mip_yes = |b: bool| tl!(if b { "Allowed" } else { "Not allowed" }).to_string();
-    row(ui, "MIP view", mip_yes(purview.rights.view));
-    row(ui, "MIP edit/save", mip_yes(purview.rights.can_edit() || purview.rights.can_save()));
-    row(ui, "MIP print", mip_yes(purview.rights.can_print()));
-    row(ui, "MIP copy/extract", mip_yes(purview.rights.can_copy()));
-    row(ui, "MIP export/change security", mip_yes(purview.rights.can_export() || purview.rights.can_change_security()));
+    if purview.protected {
+        let mip_yes = |b: bool| tl!(if b { "Allowed" } else { "Not allowed" }).to_string();
+        row(ui, "MIP view", mip_yes(purview.rights.view));
+        row(ui, "MIP edit", mip_yes(purview.rights.can_edit()));
+        row(ui, "MIP save", mip_yes(purview.rights.can_save()));
+        row(ui, "MIP print", mip_yes(purview.rights.can_print()));
+        row(ui, "MIP copy/extract", mip_yes(purview.rights.can_copy()));
+        row(ui, "MIP export", mip_yes(purview.rights.can_export()));
+        row(ui, "MIP change security", mip_yes(purview.rights.can_change_security()));
+    }
     ui.horizontal(|ui| match status {
         pdfcraft_engine::PurviewStatus::Ready if purview.protected => {
             ui.label(tl!("Changing labels or protection on protected documents is not available yet."));
@@ -51,8 +55,8 @@ pub(super) fn properties(
             } else if ui.button(tl!("Apply sensitivity label…")).clicked() {
                 req.link_command = Some("purview.apply_label");
             }
-            if purview.label.is_some() && purview.rights.can_change_security() && ui.button(tl!("Remove label")).clicked() {
-                req.link_command = Some("purview.remove_label");
+            if purview.label.is_some() && ui.button(tl!("Remove label")).clicked() {
+                req.link_command = Some("purview.apply_label");
             }
         }
         pdfcraft_engine::PurviewStatus::SignedOut => {
@@ -130,12 +134,9 @@ fn account_card(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) {
                 if selected != active_id {
                     match app.session.purview_switch_account(&selected) {
                         Ok(()) => {
-                            app.purview_labels.clear();
-                            app.purview_label_id.clear();
-                            match app.session.purview_labels() {
-                                Ok(labels) => app.purview_labels = labels,
-                                Err(error) => app.notify_fmt("Couldn't load sensitivity labels: {e}", &[("e", &error.to_string())]),
-                            }
+                            app.purview_justification.clear();
+                            let labels = app.session.purview_labels();
+                            app.update_purview_labels(labels);
                         }
                         Err(error) => app.notify_fmt("Couldn't switch Microsoft account: {e}", &[("e", &error.to_string())]),
                     }
@@ -283,12 +284,18 @@ fn signed_out_account_panel(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &T
 }
 
 pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) -> (bool, bool) {
+    let pending_name = app.purview_signin_prompt.as_ref().map(|prompt| prompt.name.clone());
+    let mut retry_started = false;
     let current_is_protected =
         app.active_ids().and_then(|(_, id)| app.session.get(id)).and_then(|doc| doc.purview().map(|purview| purview.protected)).unwrap_or(false);
     ui.vertical(|ui| {
         ui.add_space(4.0);
         let status = app.purview_status();
-        let title = if matches!(status, pdfcraft_engine::PurviewStatus::Ready) { "Sensitivity label" } else { "Microsoft account" };
+        let title = if matches!(status, pdfcraft_engine::PurviewStatus::Ready) {
+            if pending_name.is_some() { "Open protected document" } else { "Sensitivity label" }
+        } else {
+            "Microsoft account"
+        };
         ui.label(egui::RichText::new(title).font(theme::semibold(18.0)));
         ui.add_space(8.0);
         ui.separator();
@@ -307,7 +314,7 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
                         }
                         if ui.add(egui::Button::new("Sign out")).clicked() {
                             match app.session.purview_sign_out() {
-                                Ok(()) => app.notify_tr("Signed out"),
+                                Ok(()) => app.finish_purview_sign_out(),
                                 Err(error) => app.notify_fmt("Sign-out failed: {e}", &[("e", &error.to_string())]),
                             }
                         }
@@ -332,7 +339,15 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
             ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(0xD3, 0x2F, 0x2F)));
         }
 
-        if matches!(status, pdfcraft_engine::PurviewStatus::Ready) {
+        if matches!(status, pdfcraft_engine::PurviewStatus::Ready)
+            && let Some(name) = &pending_name
+        {
+            ui.label(tl!("Waiting to open"));
+            ui.label(name);
+            if ui.button(tl!("Retry opening")).clicked() {
+                retry_started = app.retry_purview_signin();
+            }
+        } else if matches!(status, pdfcraft_engine::PurviewStatus::Ready) {
             ui.add_space(8.0);
             document_protection_card(ui, app, tokens);
             ui.add_space(8.0);
@@ -344,7 +359,9 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
             }
 
             ui.label(egui::RichText::new("Sensitivity labels").font(theme::medium(12.5)).color(tokens.text));
-            if app.purview_labels.is_empty() {
+            if let Some(error) = &app.purview_labels_error {
+                ui.colored_label(egui::Color32::RED, error);
+            } else if app.purview_labels.is_empty() {
                 ui.label(
                     egui::RichText::new("No sensitivity labels are available to this account or tenant policy.")
                         .font(theme::regular(11.5))
@@ -372,23 +389,27 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
         }
     });
 
+    if retry_started {
+        return (false, true);
+    }
     let status = app.purview_status();
     let ready = matches!(status, pdfcraft_engine::PurviewStatus::Ready);
-    let active_document_rights =
-        app.active_ids().and_then(|(_, id)| app.session.get(id)).and_then(|doc| doc.purview().map(|purview| purview.rights.clone()));
     let current_has_label = app
         .active_ids()
         .and_then(|(_, id)| app.session.get(id))
         .and_then(|doc| doc.purview().map(|purview| purview.label.is_some()))
         .unwrap_or(false);
-    let can_change_security = active_document_rights.as_ref().is_some_and(|rights| rights.can_change_security());
 
     let (cancel, apply, remove_label) = if ready {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let cancel = ui.button("Cancel").clicked();
-            let apply = if !current_is_protected && !app.purview_label_id.is_empty() { ui.button("Apply label").clicked() } else { false };
+            let apply = if pending_name.is_none() && !current_is_protected && !app.purview_label_id.is_empty() {
+                ui.button("Apply label").clicked()
+            } else {
+                false
+            };
             let remove_label =
-                if !current_is_protected && current_has_label && can_change_security { ui.button("Remove label").clicked() } else { false };
+                if pending_name.is_none() && !current_is_protected && current_has_label { ui.button("Remove label").clicked() } else { false };
             (cancel, apply, remove_label)
         })
         .inner

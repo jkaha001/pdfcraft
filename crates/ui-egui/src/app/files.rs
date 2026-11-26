@@ -100,6 +100,10 @@ impl PdfCraftApp {
             }
             return r;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.purview_sign_in_job.is_some() {
+            return Err("Microsoft sign-in is in progress; wait before opening another document".into());
+        }
         self.try_open(name, path, std::sync::Arc::new(bytes), None, activate)
     }
 
@@ -117,6 +121,9 @@ impl PdfCraftApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn schedule_open_with_priority(&mut self, request: OpenRequest, priority: bool) -> Result<u64, String> {
+        if self.purview_sign_in_job.is_some() {
+            return Err("Microsoft sign-in is in progress; wait before opening another document".into());
+        }
         if self.open_worker.is_none() {
             self.open_worker = Some(
                 open_worker::OpenWorker::new(
@@ -167,6 +174,9 @@ impl PdfCraftApp {
     /// job has a `pending_opens` entry, so fewer entries than [`Self::open_slots`] means room.
     #[cfg(not(target_arch = "wasm32"))]
     fn submit_deferred_opens(&mut self) {
+        if self.purview_sign_in_job.is_some() {
+            return;
+        }
         let mut queue = std::mem::take(&mut self.deferred_opens);
         while self.deferred_opens.is_empty() && self.pending_opens.len() < self.open_slots() {
             let Some(next) = queue.pop_front() else { break };
@@ -899,6 +909,8 @@ impl PdfCraftApp {
         #[cfg(target_arch = "wasm32")]
         match self.session.purview_sign_in(None) {
             Ok(()) => {
+                self.clear_purview_labels();
+                self.purview_justification.clear();
                 self.notify_tr("Signed in");
                 self.retry_purview_signin();
             }
@@ -921,19 +933,48 @@ impl PdfCraftApp {
             Ok(labels) => {
                 self.notify_tr("Signed in");
                 self.retry_purview_signin();
-                match labels {
-                    Ok(labels) => self.purview_labels = labels,
-                    Err(error) => self.notify_fmt("Couldn't load sensitivity labels: {e}", &[("e", &error.to_string())]),
-                }
+                self.purview_justification.clear();
+                self.update_purview_labels(labels);
             }
             Err(error) => self.notify_fmt("Sign-in failed: {e}", &[("e", &error.to_string())]),
         }
     }
 
+    pub(crate) fn clear_purview_labels(&mut self) {
+        self.purview_labels.clear();
+        self.purview_label_id.clear();
+        self.purview_labels_error = None;
+    }
+
+    pub(crate) fn update_purview_labels(&mut self, result: Result<Vec<pdfcraft_engine::PurviewLabel>, pdfcraft_engine::PurviewError>) -> bool {
+        self.clear_purview_labels();
+        match result {
+            Ok(labels) => {
+                self.purview_labels = labels;
+                true
+            }
+            Err(error) => {
+                self.purview_labels_error = Some(error.to_string());
+                self.notify_fmt("Couldn't load sensitivity labels: {e}", &[("e", &error.to_string())]);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn finish_purview_sign_out(&mut self) {
+        self.clear_purview_labels();
+        self.purview_justification.clear();
+        if self.session.purview_status() == pdfcraft_engine::PurviewStatus::Ready {
+            let labels = self.session.purview_labels();
+            self.update_purview_labels(labels);
+        }
+        self.notify_tr("Signed out");
+    }
+
     /// Retry a document that was held at a Microsoft Purview sign-in boundary. The file bytes,
     /// tab activation, remote destination and tool continuation are preserved.
-    pub fn retry_purview_signin(&mut self) {
-        let Some(p) = self.purview_signin_prompt.take() else { return };
+    pub fn retry_purview_signin(&mut self) -> bool {
+        let Some(mut p) = self.purview_signin_prompt.take() else { return false };
         if self.dialog == Some(Dialog::Purview) {
             self.dialog = None;
         }
@@ -943,11 +984,11 @@ impl PdfCraftApp {
                 name: p.name.clone(),
                 path: p.path.clone(),
                 stamp: p.stamp,
-                input: open_worker::Input::Bytes(p.bytes),
+                input: open_worker::Input::Bytes(p.bytes.clone()),
                 password: None,
                 activate: p.activate,
                 after_open: p.after_open.clone(),
-                recovered: p.recovered,
+                recovered: p.recovered.clone(),
                 then: p.then,
             });
             if let Ok(token) = &result
@@ -957,12 +998,30 @@ impl PdfCraftApp {
             }
             if let Err(error) = result {
                 self.notify_fmt("Couldn't retry {name}: {e}", &[("name", &p.name), ("e", &error)]);
+                p.error = Some(error);
+                self.purview_signin_prompt = Some(p);
+                self.dialog = Some(Dialog::Purview);
+                return false;
             }
-            return;
+            return true;
         }
         let after_open = p.after_open.clone();
         match self.open_bytes_with_focus(&p.name, p.path.clone(), p.bytes.to_vec(), p.activate) {
             Ok(()) => {
+                if let Some(prompt) = self.purview_signin_prompt.as_mut() {
+                    prompt.recovered = p.recovered;
+                    prompt.then = p.then;
+                    prompt.after_open = after_open;
+                    prompt.display_override = p.display_override;
+                    return false;
+                }
+                if let Some(prompt) = self.password_prompt.as_mut() {
+                    prompt.recovered = p.recovered;
+                    prompt.then = p.then;
+                    prompt.after_open = after_open;
+                    prompt.display_override = p.display_override;
+                    return true;
+                }
                 if let Some(destination) = after_open {
                     self.apply_remote_destination(destination);
                 }
@@ -974,8 +1033,15 @@ impl PdfCraftApp {
                 if let Some(command) = p.then {
                     self.execute(command);
                 }
+                true
             }
-            Err(error) => self.notify_fmt("Couldn't retry {name}: {e}", &[("name", &p.name), ("e", &error)]),
+            Err(error) => {
+                self.notify_fmt("Couldn't retry {name}: {e}", &[("name", &p.name), ("e", &error)]);
+                p.error = Some(error);
+                self.purview_signin_prompt = Some(p);
+                self.dialog = Some(Dialog::Purview);
+                false
+            }
         }
     }
 
@@ -1126,6 +1192,11 @@ impl PdfCraftApp {
             if then.is_some() {
                 deferred.then = then;
             }
+            return OpenOutcome::Pending;
+        }
+        if self.purview_sign_in_job.is_some() {
+            self.startup_superseded = true;
+            self.deferred_opens.push_back(DeferredOpen { path: path.to_string(), after_open, then, display_override });
             return OpenOutcome::Pending;
         }
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
