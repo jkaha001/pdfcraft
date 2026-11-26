@@ -333,7 +333,12 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
                 ui.label(tl!("Microsoft sign-in and policy loading continue if you close this window."));
             }
             pdfcraft_engine::PurviewStatus::NotConfigured => {
-                ui.label(egui::RichText::new("Microsoft account sign-in is not configured").font(theme::medium(13.0)).color(tokens.text_muted));
+                ui.label(
+                    egui::RichText::new("Storytold's approved Microsoft Entra application client ID is missing")
+                        .font(theme::medium(13.0))
+                        .color(tokens.text_muted),
+                );
+                ui.label("This POC intentionally does not reuse Azure CLI credentials or a sample Microsoft client ID.");
             }
             pdfcraft_engine::PurviewStatus::SdkUnavailable => {
                 ui.label(egui::RichText::new("Protection SDK unavailable").font(theme::medium(13.0)).color(tokens.text_muted));
