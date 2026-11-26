@@ -995,6 +995,20 @@ impl PdfCraftApp {
         self.notify_tr("Signed out");
     }
 
+    pub(crate) fn purview_use_another_account(&mut self) {
+        if let Some(reason) = self.purview_account_change_reason() {
+            self.notify_tr(reason);
+            return;
+        }
+        match self.session.purview_sign_out() {
+            Ok(()) => {
+                self.finish_purview_sign_out();
+                self.start_purview_sign_in();
+            }
+            Err(error) => self.notify_fmt("Couldn't switch Microsoft account: {e}", &[("e", &error.to_string())]),
+        }
+    }
+
     /// Retry a document that was held at a Microsoft Purview sign-in boundary. The file bytes,
     /// tab activation, remote destination and tool continuation are preserved.
     pub fn retry_purview_signin(&mut self) -> bool {

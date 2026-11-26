@@ -329,8 +329,10 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
             }
             pdfcraft_engine::PurviewStatus::SignedOut => signed_out_account_panel(ui, app, tokens),
             pdfcraft_engine::PurviewStatus::SigningIn => {
-                ui.label(egui::RichText::new("Opening Microsoft sign-in").font(theme::medium(13.0)).color(tokens.text_muted));
-                ui.label(tl!("Microsoft sign-in and policy loading continue if you close this window."));
+                ui.label(egui::RichText::new("Continue signing in in your browser").font(theme::semibold(15.0)).color(tokens.text));
+                ui.add_space(6.0);
+                ui.label("A secure Microsoft sign-in window has opened. Finish there, then return to PdfCraft.");
+                ui.label("Closing this dialog does not cancel the Microsoft sign-in already in progress.");
             }
             pdfcraft_engine::PurviewStatus::NotConfigured => {
                 ui.label(
@@ -353,10 +355,18 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
         if matches!(status, pdfcraft_engine::PurviewStatus::Ready)
             && let Some(name) = &pending_name
         {
-            ui.label(tl!("Waiting to open"));
-            ui.label(name);
-            if ui.button(tl!("Retry opening")).clicked() {
-                retry_started = app.retry_purview_signin();
+            if app.purview_signin_prompt.as_ref().and_then(|prompt| prompt.error.as_deref()).is_some() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("This Microsoft account cannot open the protected file").font(theme::semibold(14.0)).color(tokens.text));
+                ui.add_space(4.0);
+                ui.label(name);
+                ui.label("Try another account, or ask the document owner to grant this account access.");
+            } else {
+                ui.label(tl!("Protected file ready to open"));
+                ui.label(name);
+                if ui.button(tl!("Open file")).clicked() {
+                    retry_started = app.retry_purview_signin();
+                }
             }
         } else if matches!(status, pdfcraft_engine::PurviewStatus::Ready) {
             ui.add_space(8.0);
@@ -411,6 +421,12 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
     let (cancel, apply, remove_label) = if ready {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let cancel = ui.button("Cancel").clicked();
+            let another_account = if pending_name.is_some() && app.purview_signin_prompt.as_ref().and_then(|prompt| prompt.error.as_deref()).is_some()
+            {
+                if app.purview_account_change_reason().is_none() { ui.button("Use another account").clicked() } else { false }
+            } else {
+                false
+            };
             let apply = if pending_name.is_none() && security_change_allowed && !app.purview_label_id.is_empty() {
                 ui.button("Apply label").clicked()
             } else {
@@ -418,6 +434,9 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
             };
             let remove_label =
                 if pending_name.is_none() && security_change_allowed && current_has_label { ui.button("Remove label").clicked() } else { false };
+            if another_account {
+                app.purview_use_another_account();
+            }
             (cancel, apply, remove_label)
         })
         .inner
