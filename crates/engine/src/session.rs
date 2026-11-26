@@ -154,6 +154,8 @@ impl Session {
         let provider = state.provider.clone();
         if let Some(editor) = document.editor.as_mut() {
             editor.cos = cos;
+            editor.undo.clear();
+            editor.redo.clear();
         } else {
             return Err(EditError::ReadOnly("this Microsoft Purview document could not be edited".into()));
         }
@@ -179,6 +181,8 @@ impl Session {
         let provider = state.provider.clone();
         if let Some(editor) = document.editor.as_mut() {
             editor.cos = cos;
+            editor.undo.clear();
+            editor.redo.clear();
         } else {
             return Err(EditError::ReadOnly("this Microsoft Purview document could not be edited".into()));
         }
@@ -203,6 +207,8 @@ impl Session {
         let provider = state.provider.clone();
         if let Some(editor) = document.editor.as_mut() {
             editor.cos = cos;
+            editor.undo.clear();
+            editor.redo.clear();
         } else {
             return Err(EditError::ReadOnly("this Microsoft Purview document could not be edited".into()));
         }

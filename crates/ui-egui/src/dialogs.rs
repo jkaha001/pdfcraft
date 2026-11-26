@@ -2251,8 +2251,12 @@ fn finish_close(app: &mut PdfCraftApp, dialog: Dialog, modal_closed: bool, req: 
         if dialog == Dialog::AttachmentDescription {
             app.attachment_description_draft = None;
         }
-        if dialog == Dialog::Purview {
-            app.purview_signin_prompt = None;
+        if dialog == Dialog::Purview
+            && let Some(prompt) = app.purview_signin_prompt.take()
+            && let Some(meta) = prompt.recovered
+            && !app.recoverable.iter().any(|item| item.key == meta.key)
+        {
+            app.recoverable.push(meta);
         }
         app.discard_properties();
         app.bulk_field_props = None;
