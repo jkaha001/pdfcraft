@@ -257,6 +257,8 @@ impl PdfCraftApp {
         }
         if d.handling == Handling::Label {
             self.read_label_crops(id);
+        } else {
+            self.cancel_label_crops();
         }
 
         // The layout, once per pass; the sheet index is clamped here.
