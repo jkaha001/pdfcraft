@@ -123,6 +123,14 @@ impl PdfCraftApp {
             }
             let Some(doc) = self.session.get(id) else { continue };
             let group: Vec<usize> = shown.iter().copied().filter(|&k| self.views.get(k).is_some_and(|v| v.id == id)).collect();
+            if doc.check_viewing().is_err() {
+                for index in group {
+                    if let Some(view) = self.views.get_mut(index) {
+                        view.suspend_rendering(&doc.renderer);
+                    }
+                }
+                continue;
+            }
             match group.as_slice() {
                 [only] => {
                     if let Some(view) = self.views.get_mut(*only) {

@@ -35,7 +35,7 @@ pub(super) fn properties(
     }
     if purview.protected {
         let mip_yes = |b: bool| tl!(if b { "Allowed" } else { "Not allowed" }).to_string();
-        row(ui, "MIP view", mip_yes(purview.rights.view));
+        row(ui, "MIP view", mip_yes(purview.rights.can_view()));
         row(ui, "MIP edit", mip_yes(purview.rights.can_edit()));
         row(ui, "MIP save", mip_yes(purview.rights.can_save()));
         row(ui, "MIP print", mip_yes(purview.rights.can_print()));
@@ -257,7 +257,7 @@ fn document_capabilities_card(ui: &mut egui::Ui, app: &PdfCraftApp, tokens: &Tok
             ui.label(egui::RichText::new("Document capabilities").font(theme::medium(12.5)).color(tokens.text));
             ui.add_space(4.0);
             egui::Grid::new("purview-document-capabilities").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                capability_row(ui, tokens, "View", purview.rights.view);
+                capability_row(ui, tokens, "View", purview.rights.can_view());
                 capability_row(ui, tokens, "Edit", purview.rights.can_edit());
                 capability_row(ui, tokens, "Save", purview.rights.can_save());
                 capability_row(ui, tokens, "Print", purview.rights.can_print());
