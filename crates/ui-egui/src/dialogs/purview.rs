@@ -279,7 +279,16 @@ fn signed_out_account_panel(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &T
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
-            if ui.add(egui::Button::new("Sign in").fill(tokens.accent)).clicked() {
+            if app.purview_signin_prompt.is_some() {
+                let email = ui.label("Work or school email (optional)");
+                ui.add(egui::TextEdit::singleline(&mut app.purview_login_hint).char_limit(320).desired_width(270.0).hint_text("name@tenant.com"))
+                    .labelled_by(email.id);
+                ui.add_space(4.0);
+                ui.label("Used only to open Microsoft sign-in. PdfCraft does not save this address or ask for a password.");
+                ui.add_space(8.0);
+            }
+            let label = if app.purview_signin_prompt.is_some() { "Continue with Microsoft" } else { "Sign in" };
+            if ui.add(egui::Button::new(label).fill(tokens.accent)).clicked() {
                 app.start_purview_sign_in();
             }
         });

@@ -2258,6 +2258,9 @@ fn finish_close(app: &mut PdfCraftApp, dialog: Dialog, modal_closed: bool, req: 
         {
             app.recoverable.push(meta);
         }
+        if dialog == Dialog::Purview {
+            app.purview_login_hint.clear();
+        }
         app.discard_properties();
         app.bulk_field_props = None;
         app.unmarked_page = Default::default();

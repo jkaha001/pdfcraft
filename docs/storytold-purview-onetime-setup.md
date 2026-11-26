@@ -402,6 +402,9 @@ or reuse Azure CLI credentials, the Azure CLI client ID, `az login`, or
 The POC obtains protection and policy tokens separately. Use the same work/school account for
 both prompts; sign-in fails if either response lacks an account identifier or they differ. A
 failed attempt to add an account leaves any existing signed-in account available.
+When a protected file is waiting to open, PdfCraft may accept one optional work/school email as
+an OAuth `login_hint`. It is cleared at browser handoff, never persisted, and never asks for a
+password. Leaving it empty keeps Microsoft's normal account chooser.
 Sign-in and its initial policy load run outside the UI thread; closing the sign-in window does not
 cancel them. A later policy refresh when opening the labeling dialog or switching accounts may
 still block the interface. Close protected documents and finish queued opens before switching accounts or
@@ -613,7 +616,7 @@ Before public release:
 - [ ] No app secret or private key exists in source or package artifacts.
 - [ ] The public support team has the critical incident contacts supplied to Microsoft.
 
-Do not publish a public SDK build only after the app registration and IPIA are complete.
+Do not publish a public SDK build until the app registration and IPIA are complete.
 Do not add customer tenant IDs to the build. The app should discover the customer tenant
 at sign-in and return to the correct authority.
 
