@@ -44,19 +44,21 @@ pub(super) fn properties(
         row(ui, "MIP change security", mip_yes(purview.rights.can_change_security()));
     }
     ui.horizontal(|ui| match status {
-        pdfcraft_engine::PurviewStatus::Ready if purview.protected => {
-            ui.label(tl!("Changing labels or protection on protected documents is not available yet."));
-        }
         pdfcraft_engine::PurviewStatus::Ready => {
-            if purview.label.is_some() {
+            if purview.protected && !purview.rights.can_change_security() {
+                ui.label(tl!("The account's Microsoft Purview rights do not allow changing this protection."));
+            } else if purview.label.is_some() {
                 if ui.button(tl!("Change sensitivity label…")).clicked() {
                     req.link_command = Some("purview.apply_label");
                 }
             } else if ui.button(tl!("Apply sensitivity label…")).clicked() {
                 req.link_command = Some("purview.apply_label");
             }
-            if purview.label.is_some() && ui.button(tl!("Remove label")).clicked() {
-                req.link_command = Some("purview.apply_label");
+            if purview.label.is_some() && (purview.rights.can_change_security() || !purview.protected) && ui.button(tl!("Remove label")).clicked() {
+                req.link_command = Some("purview.remove_label");
+            }
+            if purview.protected && purview.rights.can_export() && ui.button(tl!("Remove protection")).clicked() {
+                req.link_command = Some("purview.remove_protection");
             }
         }
         pdfcraft_engine::PurviewStatus::SignedOut => {
@@ -305,7 +307,11 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
             pdfcraft_engine::PurviewStatus::Ready => {
                 account_card(ui, app, tokens);
                 ui.add_space(8.0);
-                if let Some(reason) = app.purview_account_change_reason() {
+                if current_is_protected {
+                    if ui.button("Renew Microsoft sign-in").clicked() {
+                        app.start_purview_sign_in();
+                    }
+                } else if let Some(reason) = app.purview_account_change_reason() {
                     ui.label(tl!(reason));
                 } else {
                     ui.horizontal(|ui| {
@@ -354,10 +360,6 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
             document_capabilities_card(ui, app, tokens);
             ui.add_space(8.0);
 
-            if current_is_protected {
-                ui.label(tl!("Changing labels or protection on protected documents is not available yet."));
-            }
-
             ui.label(egui::RichText::new("Sensitivity labels").font(theme::medium(12.5)).color(tokens.text));
             if let Some(error) = &app.purview_labels_error {
                 ui.colored_label(egui::Color32::RED, error);
@@ -399,17 +401,18 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, tokens: &Tokens) ->
         .and_then(|(_, id)| app.session.get(id))
         .and_then(|doc| doc.purview().map(|purview| purview.label.is_some()))
         .unwrap_or(false);
+    let security_change_allowed = app.active_ids().and_then(|(_, id)| app.session.get(id)).is_some_and(|document| document.allows_security_change());
 
     let (cancel, apply, remove_label) = if ready {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let cancel = ui.button("Cancel").clicked();
-            let apply = if pending_name.is_none() && !current_is_protected && !app.purview_label_id.is_empty() {
+            let apply = if pending_name.is_none() && security_change_allowed && !app.purview_label_id.is_empty() {
                 ui.button("Apply label").clicked()
             } else {
                 false
             };
             let remove_label =
-                if pending_name.is_none() && !current_is_protected && current_has_label { ui.button("Remove label").clicked() } else { false };
+                if pending_name.is_none() && security_change_allowed && current_has_label { ui.button("Remove label").clicked() } else { false };
             (cancel, apply, remove_label)
         })
         .inner

@@ -267,7 +267,7 @@ impl Drop for DocumentCopy {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-type PurviewSignInResult = Result<Result<Vec<pdfcraft_engine::PurviewLabel>, pdfcraft_engine::PurviewError>, pdfcraft_engine::PurviewError>;
+type PurviewSignInResult = (bool, Result<Result<Vec<pdfcraft_engine::PurviewLabel>, pdfcraft_engine::PurviewError>, pdfcraft_engine::PurviewError>);
 
 #[cfg(not(target_arch = "wasm32"))]
 struct PendingOpen {
