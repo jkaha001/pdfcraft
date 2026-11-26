@@ -6549,6 +6549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfcraft-preview"
+version = "0.22.0"
+dependencies = [
+ "pdfcraft-render",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "pdfcraft-print"
 version = "0.22.0"
 dependencies = [
@@ -6656,6 +6665,15 @@ dependencies = [
 [[package]]
 name = "pdfcraft-testkit"
 version = "0.22.0"
+
+[[package]]
+name = "pdfcraft-thumbnails"
+version = "0.22.0"
+dependencies = [
+ "pdfcraft-render",
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "pdfcraft-ui-egui"
