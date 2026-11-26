@@ -307,7 +307,6 @@ mod idle_tests {
     use std::time::Duration;
 
     use craft::host::{AppInfo, Host, ManualJobs, ScriptedFiles};
-    use craft::platform::autosave::RecoveryStore;
 
     pub(super) struct TestDir(PathBuf);
 

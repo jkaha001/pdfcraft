@@ -27,9 +27,15 @@ pub(crate) fn strip(app: &mut PdfCraftApp, ui: &mut egui::Ui, place: Place) {
     let mut tabs: Vec<DocumentTab<StripTab>> = Vec::new();
     for index in app.tabs_in(place) {
         let Some(view) = app.views.get(index) else { continue };
+        if let Some(gid) = view.group
+            && app.group(gid).is_some_and(|g| g.collapsed)
+        {
+            continue;
+        }
         let Some(doc) = app.session.get(view.id) else { continue };
-        let name = crate::canvas::tab_label(app, index).unwrap_or_else(|| doc.name.clone());
-        let mut tab = DocumentTab::new(StripTab::View(view.pane.key), name).modified(doc.dirty).closable(true);
+        let base_name = crate::canvas::tab_label(app, index).unwrap_or_else(|| doc.name.clone());
+        let name = if view.pinned { format!("{base_name} (pinned)") } else { base_name };
+        let mut tab = DocumentTab::new(StripTab::View(view.pane.key), name).modified(doc.dirty).closable(!view.pinned);
         if let Some(path) = &doc.path
             && std::path::Path::new(path).file_name().is_some_and(|file| file.to_string_lossy() != doc.name.as_str())
         {
@@ -121,25 +127,92 @@ pub(crate) fn strip(app: &mut PdfCraftApp, ui: &mut egui::Ui, place: Place) {
 
     // The menu acts on the tab it was asked for, not the active one.
     let target: Option<u64> = app.panes.tab_menu.filter(|(menu_place, _)| *menu_place == place).map(|(_, key)| key);
-    let doc = target.and_then(|key| app.tab_with_key(key)).and_then(|i| app.views.get(i)).map(|v| v.id);
+    let view_idx = target.and_then(|key| app.tab_with_key(key));
+    let view = view_idx.and_then(|i| app.views.get(i));
+    let doc = view.map(|v| v.id);
     let path = doc.and_then(|id| app.session.get(id)).and_then(|d| d.path.clone());
     let can_reopen = !app.closed_tabs.is_empty();
+    let is_pinned = view.is_some_and(|v| v.pinned);
+    let current_group = view.and_then(|v| v.group);
+    let tabs_in_place = app.tabs_in(place);
+    let has_tabs_to_right = view_idx.is_some_and(|idx| tabs_in_place.iter().position(|&i| i == idx).is_some_and(|pos| pos + 1 < tabs_in_place.len()));
     let reveal_label = if cfg!(target_os = "macos") { tl!("Reveal in Finder") } else { tl!("Reveal in File Explorer") }.to_string();
     let mut chosen: Option<Action> = None;
     let menu = Menu::context(tl!("Tab").to_string(), &response).show(ui, |ui, _| {
         let Some(tab) = target else { return };
+
+        // Grouping options (Edge standard)
+        if let Some(current_gid) = current_group {
+            if MenuItem::new(tl!("Remove from group").to_string()).show(ui).ran {
+                chosen = Some(Action::RemoveFromGroup(tab));
+            }
+            if app.tab_groups.len() > 1 {
+                Menu::submenu_row_enabled(ui, tl!("Move to another group").to_string(), true, |ui, _| {
+                    for g in &app.tab_groups {
+                        if g.id != current_gid {
+                            let dot = format!("● {}", if g.title.is_empty() { g.color.name() } else { &g.title });
+                            if MenuItem::new(dot).show(ui).ran {
+                                chosen = Some(Action::AddToGroup { tab, group_id: g.id });
+                            }
+                        }
+                    }
+                });
+            }
+        } else {
+            if MenuItem::new(tl!("Add tab to new group").to_string()).show(ui).ran {
+                chosen = Some(Action::AddToNewGroup(tab));
+            }
+            if !app.tab_groups.is_empty() {
+                Menu::submenu_row_enabled(ui, tl!("Add tab to group").to_string(), true, |ui, _| {
+                    if MenuItem::new(tl!("New group").to_string()).show(ui).ran {
+                        chosen = Some(Action::AddToNewGroup(tab));
+                    }
+                    ui.separator();
+                    for g in &app.tab_groups {
+                        let dot = format!("● {}", if g.title.is_empty() { g.color.name() } else { &g.title });
+                        if MenuItem::new(dot).show(ui).ran {
+                            chosen = Some(Action::AddToGroup { tab, group_id: g.id });
+                        }
+                    }
+                });
+            }
+        }
+
+        ui.separator();
+
+        // Pinning (Edge standard)
+        let pin_label = if is_pinned { tl!("Unpin tab") } else { tl!("Pin tab") }.to_string();
+        if MenuItem::new(pin_label).show(ui).ran {
+            chosen = Some(Action::TogglePin(tab));
+        }
+
+        // Duplicate tab (Edge standard)
+        if MenuItem::new(tl!("Duplicate tab").to_string()).show(ui).ran {
+            chosen = Some(Action::Duplicate(tab));
+        }
+
+        ui.separator();
+
         if MenuItem::new(tl!("Close Tab").to_string()).show(ui).ran {
             chosen = Some(Action::Close(tab));
+        }
+        if MenuItem::new(tl!("Close other tabs").to_string()).show(ui).ran {
+            chosen = Some(Action::CloseOthers(tab));
+        }
+        if MenuItem::new(tl!("Close tabs to the right").to_string()).enabled(has_tabs_to_right).show(ui).ran {
+            chosen = Some(Action::CloseToRight(tab));
         }
         if MenuItem::new(tl!("Reopen Closed Tab").to_string()).enabled(can_reopen).show(ui).ran {
             chosen = Some(Action::Reopen);
         }
+        ui.separator();
         if MenuItem::new(tl!("Split right").to_string()).show(ui).ran {
             chosen = Some(Action::Split { tab, down: false });
         }
         if MenuItem::new(tl!("Split down").to_string()).show(ui).ran {
             chosen = Some(Action::Split { tab, down: true });
         }
+        ui.separator();
         if MenuItem::new(reveal_label.clone()).enabled(CAN_REVEAL && path.is_some()).show(ui).ran
             && let Some(id) = doc
         {

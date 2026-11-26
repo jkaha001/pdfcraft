@@ -57,11 +57,13 @@ mod home;
 mod hotbar;
 mod panels;
 pub mod panes;
+pub mod tab_group;
 pub use print_ui::{
     DefaultPaperSource, Handling as PrintHandling, OptionsSource, PrintDraft, PrinterPapersSource, PrinterSetup, PrinterSource, Spooler,
     TwoSidedSource, Which as PrintWhich, system_printers, system_two_sided,
 };
 pub use redact_ui::{HiddenDraft, RedactPrefs, SearchDraft as RedactSearchDraft, SearchMode as RedactSearchMode};
+pub use tab_group::{TabGroup, TabGroupColor, TabGroupId};
 pub mod i18n;
 pub mod viewer_prefs;
 // PLAN: the lead adds `mod notices; mod icons; mod brand; mod colour_picker; pub mod fonts;` here, and `pub mod settings;` in app.rs, at combine (L-212).
@@ -250,6 +252,11 @@ pub struct PdfCraftApp {
     pub(crate) status_captions_lang: Option<i18n::Lang>,
     pub views: Vec<DocView>,
     pub(crate) closed_tabs: Vec<String>,
+    /// Browser-styled tab groups for document tabs.
+    pub tab_groups: Vec<tab_group::TabGroup>,
+    pub next_group_id: u64,
+    pub editing_group: Option<tab_group::TabGroupId>,
+    pub group_title_draft: String,
     /// The Rename dialog's name being typed.
     pub(crate) rename_draft: Option<rename_ui::RenameDraft>,
     /// A name typed in Rename whose "Save and Rename" save did not go through; the dialog opens
