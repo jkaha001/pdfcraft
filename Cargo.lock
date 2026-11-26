@@ -6545,7 +6545,9 @@ dependencies = [
  "flate2",
  "pdfcraft-content",
  "pdfcraft-cos",
+ "pdfcraft-filters",
  "pdfcraft-model",
+ "proptest",
 ]
 
 [[package]]
