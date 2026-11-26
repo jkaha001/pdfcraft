@@ -30,6 +30,7 @@ use regions::{alignment_frame, existing_gap, group_blocks, is_centred, rewrite_c
 pub use session::TextSession;
 
 mod blocks;
+mod caret;
 mod editor;
 mod fallback;
 pub mod forms;
@@ -44,6 +45,7 @@ pub use blocks::{
     replace_block, text_blocks,
 };
 use blocks::{kept_words, paragraph_separator, row_break};
+pub use caret::DraftRow;
 pub use editor::{TextEditLayout, TextEditorFont, register_text_font, text_edit_layout, text_editor_fonts};
 use editor::{builtin_thai_choice, layout_draft};
 use fallback::{
@@ -83,6 +85,8 @@ pub struct TextLine {
     /// its last, without the spaces and `TJ` adjustments around it. `rect` also spans gaps that
     /// draw nothing, such as the adjustment an applied redaction leaves where text was removed.
     pub ink: Vec<[f64; 4]>,
+    /// Bounded character advances from the PDF text operators, for editor hit testing.
+    characters: Vec<caret::CharacterPosition>,
     /// The font's resource name and `/BaseFont` (or Type 3 descriptor's `/FontName`), and its size in text space.
     pub font: String,
     pub base_font: String,
@@ -143,6 +147,12 @@ pub struct TextLine {
 }
 
 impl TextLine {
+    /// How many caret positions the line holds.
+    #[cfg(test)]
+    pub(crate) fn caret_positions(&self) -> usize {
+        self.characters.len()
+    }
+
     /// Refuses editing a line whose font's writing mode couldn't be read (§9.7.4.3).
     fn ensure_editable(&self) -> Result<(), EditError> {
         self.unreadable_mode.as_ref().map_or(Ok(()), |why| Err(EditError::Invalid(why.clone())))
