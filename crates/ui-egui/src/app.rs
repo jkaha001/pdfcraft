@@ -499,6 +499,7 @@ impl PdfCraftApp {
             redact_search_open: false,
             hidden_draft: None,
             print_draft: PrintDraft::default(),
+            batch_print: dialogs::batch_print::BatchPrintDraft::default(),
             text_style: content_ui::default_style(),
             edit_more: false,
             replace_source: None,
@@ -621,6 +622,7 @@ impl PdfCraftApp {
             || self.js_dialog.is_some()
             || self.comment_props.is_some()
             || self.stamp_dialog.is_some()
+            || self.batch_print.open
     }
 
     /// Show `msg` as a notice.
