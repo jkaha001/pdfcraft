@@ -375,6 +375,7 @@ Estimates unchanged.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-11 | minor | M10: include staged OCR models and notices in standalone CLI archives. Estimates unchanged. |
 | 2026-10-16 | patch | M4: Insert from File retains catalog attachments with native undo/redo; existing name trees and encoded duplicate keys survive. Estimates unchanged. |
 | 2026-11-16 | patch | M5 #3741: Ctrl+M opens Comments on Windows/Linux without toggling it closed; macOS leaves Command+M for Minimize; platform-specific shortcut surfaces and regressions retained; estimates unchanged. |
 | 2026-10-29 | minor | M10 #5029: existing Text appearances keep their implicit NoRotate orientation in vector printing even when the flag is clear. Print eligibility and source/AP objects remain unchanged; native viewing without the flag remains a separate gap. Estimates unchanged. |
